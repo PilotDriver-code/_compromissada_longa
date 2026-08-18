@@ -1,0 +1,40 @@
+WITH posicao_norm AS (
+    SELECT
+        p.*,
+        CASE
+            WHEN UPPER(p.indexador) LIKE 'CDI%'                          THEN 'CDI ano'
+            WHEN UPPER(p.indexador) LIKE 'IPCA%'                         THEN 'IPCA anual'
+            WHEN UPPER(p.indexador) LIKE 'PRE%'
+              OR UPPER(p.indexador) LIKE 'PRÉ%'                          THEN 'PREFIXADO'
+            ELSE p.indexador
+        END AS indexador_base
+    FROM posicao p
+    WHERE p.data_posicao = DATE '2026-04-14'
+)
+SELECT
+    p.cliente,
+    p.operacao,
+    p.ativo,
+    p.data_compra,
+    p.data_posicao,
+    p.pu_compra,
+    p.indexador,
+    p.indexador_base,
+    p.juros_emissao,
+    -- prefixado NÃO tem data de indexador; nos demais, a data do as-of
+    CASE WHEN p.indexador_base = 'PREFIXADO' THEN NULL
+         ELSE idx.data_ref
+    END AS data_indexador,
+    -- prefixado usa o juros de emissão; os demais usam o acumulado da tabela
+    CASE WHEN p.indexador_base = 'PREFIXADO' THEN p.juros_emissao
+         ELSE idx.valor_acum
+    END AS indexador_ano_acumulado
+FROM posicao_norm p
+LEFT JOIN LATERAL (
+    SELECT i.data_ref, i.valor_acum
+    FROM indexador i
+    WHERE i.nome_indexador = p.indexador_base
+      AND i.data_ref <= p.data_posicao
+    ORDER BY i.data_ref DESC
+    LIMIT 1
+) idx ON true;
