@@ -1,0 +1,125 @@
+SELECT codigo_lastro, sigla_sistema_origem, COUNT(*) AS qtd
+FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa
+WHERE sigla_sistema_origem = 'LZ'
+GROUP BY codigo_lastro, sigla_sistema_origem
+HAVING COUNT(*) > 1
+LIMIT 20
+
+
+
+-- =============================================================================
+-- Fluxo completo dos lastros a tratar — AWS Athena
+--
+-- Exemplo preenchido para:
+--   Intervalo de eventos : 07/11/2026 a 09/11/2026
+--   Janela de posição    : 28/10/2026 a 06/11/2026  (D-7 a D-1 úteis ANBIMA da data inicial)
+--
+-- Na rotina Python, as 4 datas marcadas com [PARAM] são calculadas
+-- automaticamente (incluindo o calendário ANBIMA). Aqui estão fixas só
+-- para você conseguir rodar e conferir no Athena.
+--
+-- A query NÃO decide nada sobre regras: só traz os dados. O agrupamento por
+-- dia útil, a detecção de "lastro sem fluxo" e as regras de I/J/L/B/M ficam
+-- no Python.
+-- =============================================================================
+
+WITH
+-- 1) Lastros com pelo menos um evento no intervalo informado
+lastros_com_evento AS (
+    SELECT DISTINCT
+        ev.codigo_lastro,
+        ev.sigla_sistema_origem
+    FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_evento_renda_fixa ev
+    WHERE ev.sigla_sistema_origem = 'LZ'
+      AND ev.data_evento >= TIMESTAMP '2026-11-07 00:00:00'   -- [PARAM] data inicial
+      AND ev.data_evento <  TIMESTAMP '2026-11-10 00:00:00'   -- [PARAM] data final + 1 dia
+),
+
+-- 2) Lastros com posição na janela D-7 a D-1
+lastros_com_posicao AS (
+    SELECT DISTINCT
+        posicao.codigo_ativo_lastro AS codigo_lastro,
+        posicao.sigla_sistema_origem
+    FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_posicao_fundo_renda_fixa posicao
+    WHERE posicao.sigla_sistema_origem = 'LZ'
+      AND posicao.data_posicao >= TIMESTAMP '2026-10-28 00:00:00'   -- [PARAM] D-7 útil
+      AND posicao.data_posicao <  TIMESTAMP '2026-11-07 00:00:00'   -- [PARAM] D-1 útil + 1 dia
+),
+
+-- 3) Lastros base: têm evento no intervalo E têm posição
+lastros_base AS (
+    SELECT e.codigo_lastro, e.sigla_sistema_origem
+    FROM lastros_com_evento e
+    INNER JOIN lastros_com_posicao p
+            ON p.codigo_lastro        = e.codigo_lastro
+           AND p.sigla_sistema_origem = e.sigla_sistema_origem
+),
+
+-- 4) Ativos (codigo_clearing) desses lastros, via cadastro
+ativos_base AS (
+    SELECT DISTINCT
+        cad.codigo_clearing,
+        cad.sigla_sistema_origem
+    FROM lastros_base b
+    INNER JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad
+            ON cad.codigo_lastro        = b.codigo_lastro
+           AND cad.sigla_sistema_origem = b.sigla_sistema_origem
+    WHERE cad.codigo_clearing IS NOT NULL
+),
+
+-- 5) Lastros "irmãos": mesmo codigo_clearing, com posição, que ainda não
+--    estão nos lastros base (podem não ter nenhum evento cadastrado)
+lastros_irmaos AS (
+    SELECT DISTINCT
+        cad.codigo_lastro,
+        cad.sigla_sistema_origem
+    FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad
+    INNER JOIN ativos_base a
+            ON a.codigo_clearing      = cad.codigo_clearing
+           AND a.sigla_sistema_origem = cad.sigla_sistema_origem
+    INNER JOIN lastros_com_posicao p
+            ON p.codigo_lastro        = cad.codigo_lastro
+           AND p.sigla_sistema_origem = cad.sigla_sistema_origem
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM lastros_base b
+        WHERE b.codigo_lastro        = cad.codigo_lastro
+          AND b.sigla_sistema_origem = cad.sigla_sistema_origem
+    )
+),
+
+-- 6) Todos os lastros que entram na análise
+lastros_selecionados AS (
+    SELECT codigo_lastro, sigla_sistema_origem, 'EVENTO_NO_INTERVALO' AS origem_selecao
+    FROM lastros_base
+    UNION ALL
+    SELECT codigo_lastro, sigla_sistema_origem, 'IRMAO_SEM_EVENTO' AS origem_selecao
+    FROM lastros_irmaos
+)
+
+-- 7) Fluxo COMPLETO (todas as datas) de cada lastro selecionado.
+--    LEFT JOIN nos eventos: um lastro irmão sem nenhum evento aparece em
+--    uma linha com data_evento / sigla_evento / percentual vazios, só para
+--    trazer os dados de cadastro usados na criação do J + I.
+SELECT
+    sel.codigo_lastro,
+    ev.data_evento,
+    ev.sigla_evento,
+    ev.percentual_juros_evento,
+    sel.sigla_sistema_origem,
+    cad_lastro.tipo_ativo,
+    cad_lastro.data_vencimento,
+    cad_lastro.codigo_clearing,
+    sel.origem_selecao
+FROM lastros_selecionados sel
+LEFT JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_evento_renda_fixa ev
+       ON ev.codigo_lastro        = sel.codigo_lastro
+      AND ev.sigla_sistema_origem = sel.sigla_sistema_origem
+LEFT JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad_lastro
+       ON cad_lastro.codigo_lastro        = sel.codigo_lastro
+      AND cad_lastro.sigla_sistema_origem = sel.sigla_sistema_origem
+ORDER BY
+    cad_lastro.codigo_clearing,
+    sel.codigo_lastro,
+    ev.data_evento,
+    ev.sigla_evento
