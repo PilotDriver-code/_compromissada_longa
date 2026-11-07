@@ -1,3 +1,17 @@
+-- ============================================================================= CONSULTA PARA SABER SE TEM MAIS DE LASTRO PARA UM MESMO ATIVO
+SELECT
+    codigo_clearing,
+    COUNT(DISTINCT codigo_lastro) AS qtd_lastros,
+    array_agg(codigo_lastro)      AS lastros
+FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa
+WHERE sigla_sistema_origem = 'LZ'
+GROUP BY codigo_clearing
+HAVING COUNT(DISTINCT codigo_lastro) > 1
+LIMIT 20
+
+
+
+-- ============================================================================= CONSULTA PARA SABER SE TEM MAIS DE UM CD_LASTRO
 SELECT codigo_lastro, sigla_sistema_origem, COUNT(*) AS qtd
 FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa
 WHERE sigla_sistema_origem = 'LZ'
