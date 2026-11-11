@@ -43,14 +43,25 @@ R9. Ligada (padrão):
       - Linha nova I usa a data do J copiado; o par J + I usa a data do J do
         irmão (o mais antigo) ou, sem J, a do primeiro evento do irmão.
 
-Pendências (o lastro/grupo NÃO é alterado em nada, nem a data):
+Pendências — o lastro INTEIRO fica fora do fluxo final, sem nenhuma
+alteração (nem data), e não recebe par J + I como irmão:
 R6. Evento repetido no mesmo grupo (não deveria ocorrer: erro de dados).
 R7. Código de evento fora de I, J, M, L, B.
 R8. Lastro sem codigo_clearing (sem cadastro).
+    Basta uma pendência em um dia útil para o lastro todo sair.
+
+Validação de amortização (após todo o tratamento):
+R10. Para cada lastro do fluxo final, a soma do percentual de TODOS os
+     eventos I (fluxo completo) deve ser 100, com tolerância de 0,000001
+     (os I de 0,00000000000001 não pesam). Consolidado: soma de todos os lastros
+     = quantidade de lastros x 100. Lastros em pendência não entram.
+     Nada é ajustado: divergências só são sinalizadas.
 
 Saída:
-- Fluxo tratado = fluxo FINAL completo de todos os lastros (eventos excluídos
-  não aparecem; ficam só no log).
+- Fluxo tratado = fluxo FINAL completo dos lastros que sobem para o arquivo
+  (eventos excluídos não aparecem; ficam só no log).
+- Fluxo das pendências (como veio da query), validação por lastro e
+  consolidada.
 - Log de alterações, diagnóstico por grupo, pendências e resumo.
 - Percentuais em pontos percentuais (100 = 100%).
 """
@@ -112,6 +123,11 @@ CASOS_DOCUMENTADOS: dict[frozenset[str], str] = {
     frozenset({EVENTO_J, EVENTO_L}): CASO_5,
 }
 
+# Validação de amortização
+PERCENTUAL_TOTAL = 100.0
+TOLERANCIA_AMORTIZACAO = 1e-6    # pontos percentuais, por lastro
+STATUS_OK, STATUS_ERRO = "OK", "ERRO"
+
 TIPO_INCLUSAO = "INCLUSAO"
 TIPO_EXCLUSAO = "EXCLUSAO"
 TIPO_ALTERACAO = "ALTERACAO_PERCENTUAL"
@@ -122,6 +138,7 @@ MARCA_INCLUIDA = "incluida"
 MARCA_EXCLUIDA = "excluida"
 MARCA_J_ALTERADO = "j_alterado"
 MARCA_DATA = "data_alterada"
+MARCA_PENDENCIA = "pendencia"
 
 COL_LOG_DIA_UTIL = "Dia Útil"
 COLUNAS_LOG = [
@@ -162,6 +179,9 @@ class ResultadoProcessamento:
     log_alteracoes: pd.DataFrame
     diagnostico: pd.DataFrame
     pendencias: pd.DataFrame
+    fluxo_pendencias: pd.DataFrame = field(default_factory=pd.DataFrame)  # fluxo dos lastros em pendência
+    validacao_lastros: pd.DataFrame = field(default_factory=pd.DataFrame)
+    validacao_consolidada: dict = field(default_factory=dict)
     resumo: dict = field(default_factory=dict)
     # Marca de cada linha (para colorir o Excel):
     #   marcas_antes  -> alinhada às linhas do DataFrame de entrada (mesma ordem)
@@ -306,13 +326,24 @@ def processar_eventos(
 
     grupos_validos = no_intervalo[no_intervalo[COL_ATIVO].notna()]
 
+    # --- Pendência vale para o lastro INTEIRO: ele sai do fluxo final -------
+    lastros_pendencia: set = set(trabalho.loc[sem_ativo, COL_LASTRO])
+    classificacao: dict = {}
+    for chave, grupo in grupos_validos.groupby(CHAVE_ATIVO + [_DIA_UTIL], sort=False):
+        classificacao[chave] = classificar_grupo(grupo[COL_EVENTO].tolist())
+        if classificacao[chave][0] == PENDENCIA:
+            lastros_pendencia.add(chave[0])
+
     # --- R1-R4 (+ R9): regras por (lastro, ativo, dia útil) ----------------
     for (lastro, ativo, dia_util), grupo in grupos_validos.groupby(CHAVE_ATIVO + [_DIA_UTIL], sort=False):
         eventos = grupo[COL_EVENTO].tolist()
-        caso, motivo = classificar_grupo(eventos)
+        caso, motivo = classificacao[(lastro, ativo, dia_util)]
+        em_pendencia = lastro in lastros_pendencia
+        if em_pendencia and caso != PENDENCIA:
+            motivo = "Lastro fora do arquivo final: pendência em outro dia útil"
         acoes: list[str] = []
 
-        if caso != PENDENCIA:
+        if not em_pendencia:
             tem_l_ou_b = bool(EVENTOS_EXCLUIDOS & set(eventos))
             linhas_j = grupo[grupo[COL_EVENTO] == EVENTO_J]
 
@@ -357,7 +388,7 @@ def processar_eventos(
                 log.append(_entrada_log(modelo, dia_util, caso, TIPO_INCLUSAO, None, data_i,
                                         None, EVENTO_I, None, PERCENTUAL_MINIMO))
 
-        if caso == PENDENCIA:
+        if em_pendencia:
             finais = eventos
         else:
             finais = [e for e in eventos if e not in EVENTOS_EXCLUIDOS]
@@ -383,7 +414,8 @@ def processar_eventos(
 
     for (ativo, dia_util), grupo_ativo in grupos_validos.groupby([COL_ATIVO, _DIA_UTIL], sort=False):
         com_evento = set(grupo_ativo[COL_LASTRO])
-        faltantes = [l for l in lastros_por_ativo[ativo] if l not in com_evento]
+        faltantes = [l for l in lastros_por_ativo[ativo]
+                     if l not in com_evento and l not in lastros_pendencia]
         if not faltantes:
             continue
 
@@ -419,8 +451,20 @@ def processar_eventos(
         trabalho.loc[idx, _MARCA] = MARCA_J_ALTERADO
     for idx in indices_excluir:
         trabalho.loc[idx, _MARCA] = MARCA_EXCLUIDA
+    trabalho.loc[trabalho[COL_LASTRO].isin(lastros_pendencia) & ~vazia, _MARCA] = MARCA_PENDENCIA
     marcas_antes = trabalho[_MARCA].where(trabalho[_MARCA].notna(), None).tolist()
     trabalho.loc[indices_excluir, _MARCA] = None
+    trabalho.loc[trabalho[_MARCA] == MARCA_PENDENCIA, _MARCA] = None
+
+    # --- Lastros em pendência: saem do fluxo final, sem nenhuma alteração ---
+    em_pend = trabalho[COL_LASTRO].isin(lastros_pendencia)
+    fluxo_pendencias = (
+        trabalho[em_pend & ~vazia]
+        .sort_values([COL_ATIVO, COL_LASTRO, COL_DATA, _ORDEM], kind="stable", na_position="last")
+        .drop(columns=[_ORDEM, _MARCA, COL_DATA_ORIGINAL])
+        .reset_index(drop=True)
+    )
+    trabalho = trabalho[~em_pend]
 
     # --- Montagem do fluxo final -------------------------------------------
     for idx, valor in alteracoes_percentual.items():
@@ -457,6 +501,7 @@ def processar_eventos(
         log_alteracoes=registrar_alteracoes(log),
         diagnostico=df_diag,
         pendencias=pendencias,
+        fluxo_pendencias=fluxo_pendencias,
         marcas_antes=marcas_antes,
         marcas_depois=marcas_depois,
     )
@@ -465,6 +510,55 @@ def processar_eventos(
 def registrar_alteracoes(entradas: list[dict]) -> pd.DataFrame:
     """Converte as entradas de log em DataFrame com colunas padronizadas."""
     return pd.DataFrame(entradas, columns=COLUNAS_LOG)
+
+
+# ---------------------------------------------------------------------------
+# Validação de amortização (Etapa 3)
+# ---------------------------------------------------------------------------
+def validar_amortizacoes(
+    fluxo_tratado: pd.DataFrame,
+    dados_originais: pd.DataFrame,
+    tolerancia: float = TOLERANCIA_AMORTIZACAO,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Soma o percentual de TODOS os eventos I do fluxo completo de cada lastro
+    do fluxo final e compara com 100 (com tolerância). Também faz a validação
+    consolidada: soma de todos os lastros = quantidade de lastros x 100.
+
+    Lastros em pendência não estão no fluxo final, então ficam de fora.
+    Nenhum percentual é ajustado: apenas sinaliza.
+    """
+    def soma_i(df: pd.DataFrame) -> pd.Series:
+        return df[df[COL_EVENTO] == EVENTO_I].groupby(CHAVE_ATIVO)[COL_PERCENTUAL].sum()
+
+    colunas_id = CHAVE_ATIVO + ([COL_ORIGEM] if COL_ORIGEM in fluxo_tratado.columns else [])
+    validacao = fluxo_tratado[colunas_id].drop_duplicates(CHAVE_ATIVO).reset_index(drop=True)
+
+    originais = dados_originais[~_eh_linha_vazia(dados_originais)]
+    antes = soma_i(originais).rename("Soma I Antes")
+    depois = soma_i(fluxo_tratado).rename("Soma I Depois")
+    validacao = (validacao
+                 .merge(antes, left_on=CHAVE_ATIVO, right_index=True, how="left")
+                 .merge(depois, left_on=CHAVE_ATIVO, right_index=True, how="left"))
+    validacao[["Soma I Antes", "Soma I Depois"]] = validacao[["Soma I Antes", "Soma I Depois"]].fillna(0.0)
+    validacao["Diferença p/ 100"] = validacao["Soma I Depois"] - PERCENTUAL_TOTAL
+    validacao["Status"] = [STATUS_OK if abs(d) <= tolerancia else STATUS_ERRO
+                           for d in validacao["Diferença p/ 100"]]
+
+    qtd = len(validacao)
+    esperado = qtd * PERCENTUAL_TOTAL
+    encontrado = float(validacao["Soma I Depois"].sum())
+    tolerancia_total = qtd * tolerancia
+    consolidado = {
+        "Lastros validados": qtd,
+        "Soma esperada": esperado,
+        "Soma encontrada": encontrado,
+        "Diferença": encontrado - esperado,
+        "Tolerância usada": tolerancia_total,
+        "Status": STATUS_OK if abs(encontrado - esperado) <= tolerancia_total else STATUS_ERRO,
+        "Lastros com divergência": int((validacao["Status"] == STATUS_ERRO).sum()),
+    }
+    return validacao, consolidado
 
 
 # ---------------------------------------------------------------------------
@@ -502,8 +596,11 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
         "Lastros que receberam J + I (sem evento no dia útil)": len(lastros(diag["Caso"] == LASTRO_SEM_EVENTO)),
         "Pares J + I incluídos": contar(TIPO_INCLUSAO, "Evento Final", EVENTO_J, LASTRO_SEM_EVENTO),
         "Lastros sem necessidade de alteração": len(todos - com_acao - com_pendencia),
-        "Lastros com pendência (não tratados)": len(com_pendencia),
-        "Lastros com divergência no percentual de amortização": "Etapa 3",
+        "Lastros com pendência (fora do arquivo final)": len(com_pendencia),
+        "Lastros no arquivo final": resultado.validacao_consolidada.get("Lastros validados"),
+        "Lastros com divergência no percentual de amortização":
+            resultado.validacao_consolidada.get("Lastros com divergência"),
+        "Validação consolidada de amortização": resultado.validacao_consolidada.get("Status"),
     }
 
 
@@ -516,13 +613,9 @@ def executar(df_query: pd.DataFrame, data_inicial, data_final,
     """preparar -> processar -> resumo."""
     dados = preparar_dados(df_query)
     resultado = processar_eventos(dados, data_inicial, data_final, calendario, levar_para_dia_util)
+    resultado.validacao_lastros, resultado.validacao_consolidada = validar_amortizacoes(
+        resultado.fluxo_tratado, dados)
     resultado.resumo = gerar_resumo(resultado)
     return resultado
 
 
-# ---------------------------------------------------------------------------
-# Etapa 3 (a implementar)
-# ---------------------------------------------------------------------------
-def validar_amortizacoes(fluxo_tratado: pd.DataFrame):
-    """Etapa 3: soma de I por lastro e validação consolidada."""
-    raise NotImplementedError("Etapa 3.")
