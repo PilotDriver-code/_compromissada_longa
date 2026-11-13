@@ -108,17 +108,22 @@ def gerar_excels(
     data_final,
     pasta_saida: str | Path = ".",
     levar_para_dia_util: bool = True,
+    tipos_ativo: list[str] | None = None,
+    excluir_compromissada: bool = True,
 ) -> tuple[Path, Path, tf.ResultadoProcessamento]:
     """
     Aplica o tratamento ao DataFrame da query e salva:
         fluxo_ANTES_<ini>_a_<fim>.xlsx  -> dados como vieram da query
-        fluxo_DEPOIS_<ini>_a_<fim>.xlsx -> fluxo final + validações, pendências, log, diagnóstico, resumo
+        fluxo_DEPOIS_<ini>_a_<fim>.xlsx -> fluxo final + validações, pendências, vencendo,
+                                           fora da análise, log, diagnóstico, resumo
+    tipos_ativo: lista dos tipos que ENTRAM na análise (None = sem filtro).
     Retorna (caminho_antes, caminho_depois, resultado).
     """
     from openpyxl.styles import PatternFill
 
     antes = tf.preparar_dados(df_query).reset_index(drop=True)  # só normaliza tipos
-    resultado = tf.executar(df_query, data_inicial, data_final, levar_para_dia_util=levar_para_dia_util)
+    resultado = tf.executar(df_query, data_inicial, data_final, levar_para_dia_util=levar_para_dia_util,
+                            tipos_ativo=tipos_ativo, excluir_compromissada=excluir_compromissada)
 
     cores = {
         tf.MARCA_INCLUIDA: PatternFill("solid", fgColor="C6EFCE"),    # verde
@@ -126,9 +131,11 @@ def gerar_excels(
         tf.MARCA_DATA: PatternFill("solid", fgColor="BDD7EE"),        # azul
         tf.MARCA_EXCLUIDA: PatternFill("solid", fgColor="FFC7CE"),    # vermelho
         tf.MARCA_PENDENCIA: PatternFill("solid", fgColor="D9D9D9"),   # cinza
+        tf.MARCA_FORA_ANALISE: PatternFill("solid", fgColor="E4DFEC"),  # lilás
+        tf.MARCA_VENCENDO: PatternFill("solid", fgColor="FCE4D6"),      # laranja
     }
     legenda = pd.DataFrame({
-        "Cor": ["Verde", "Amarelo", "Azul", "Vermelho", "Cinza"],
+        "Cor": ["Verde", "Amarelo", "Azul", "Vermelho", "Cinza", "Lilás", "Laranja"],
         "Significado": [
             "Linha incluída pela rotina (I, ou J + I de lastro sem evento)",
             f"J com percentual alterado para {MINIMO_TXT} (a data também pode ter ido para o dia útil — ver log)",
@@ -137,6 +144,9 @@ def gerar_excels(
             "Na aba Validações: lastro com divergência na soma de I",
             "Lastro em pendência: fica fora do arquivo final (ver abas Pendências e Fluxo Pendências) "
             "— só aparece no arquivo ANTES",
+            "Lastro fora da análise: tipo de ativo fora do filtro ou compromissada (ver aba Fora da Análise) "
+            "— só aparece no arquivo ANTES",
+            "Lastro vencendo no intervalo: sem atuação (ver aba Lastros Vencendo) — só aparece no arquivo ANTES",
         ],
     })
 
@@ -157,6 +167,8 @@ def gerar_excels(
                              cores[tf.MARCA_INCLUIDA], cores[tf.MARCA_EXCLUIDA])
         _escrever_aba(excel, resultado.pendencias, "Pendências")
         _escrever_aba(excel, resultado.fluxo_pendencias, "Fluxo Pendências")
+        _escrever_aba(excel, resultado.fluxo_vencendo, "Lastros Vencendo")
+        _escrever_aba(excel, resultado.fluxo_fora_analise, "Fora da Análise")
         _escrever_aba(excel, resultado.log_alteracoes, "Log de Alterações")
         _escrever_aba(excel, resultado.diagnostico, "Diagnóstico")
         _escrever_aba(excel, pd.DataFrame(list(resultado.resumo.items()), columns=["Item", "Valor"]), "Resumo")
