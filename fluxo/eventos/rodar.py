@@ -10,6 +10,7 @@ Como rodar (a partir da pasta raiz do projeto):
 ou pelo botão "Run" do VS Code com este arquivo aberto.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ DATA_INICIAL = "2026-11-10"
 DATA_FINAL = "2026-11-10"
 
 PASTA_SAIDA = RAIZ_PROJETO / "saida"
+ARQUIVO_FILTROS = RAIZ_PROJETO / "config" / "filtros.json"   # tipos de ativo que ENTRAM na análise
 DSN_ATHENA = "AWS Athena ODBC"
 DIAS_UTEIS_POSICAO = 7   # janela de posição: D-7 até D-1
 
@@ -39,6 +41,20 @@ DIAS_UTEIS_POSICAO = 7   # janela de posição: D-7 até D-1
 #         (data cadastrada fica na coluna data_evento_original)
 # False = mantém as datas cadastradas
 LEVAR_PARA_DIA_UTIL = True
+
+
+# ---------------------------------------------------------------------------
+# Configuração de filtros
+# ---------------------------------------------------------------------------
+def carregar_tipos_ativo(caminho: Path = ARQUIVO_FILTROS) -> list[str]:
+    """Lê a lista de tipos de ativo que entram na análise (config/filtros.json)."""
+    if not caminho.exists():
+        raise FileNotFoundError(f"Arquivo de configuração não encontrado: {caminho}")
+    config = json.loads(caminho.read_text(encoding="utf-8"))
+    tipos = [str(t).strip() for t in config.get("tipos_ativo", []) if str(t).strip()]
+    if not tipos:
+        raise ValueError(f"Nenhum tipo de ativo configurado em 'tipos_ativo' ({caminho}).")
+    return tipos
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +123,15 @@ def obter_dados_athena(data_inicial, data_final) -> pd.DataFrame:
 # Rotina
 # ---------------------------------------------------------------------------
 def rodar(data_inicial: str, data_final: str) -> None:
+    tipos_ativo = carregar_tipos_ativo()
+    print(f"Tipos de ativo na análise: {', '.join(tipos_ativo)}")
+
     df = obter_dados_athena(data_inicial, data_final)
     print(f"Linhas recebidas da query: {len(df)}")
 
     caminho_antes, caminho_depois, resultado = gerar_excels(
-        df, data_inicial, data_final, PASTA_SAIDA, levar_para_dia_util=LEVAR_PARA_DIA_UTIL
+        df, data_inicial, data_final, PASTA_SAIDA,
+        levar_para_dia_util=LEVAR_PARA_DIA_UTIL, tipos_ativo=tipos_ativo,
     )
 
     print("\n=== RESUMO ===")
