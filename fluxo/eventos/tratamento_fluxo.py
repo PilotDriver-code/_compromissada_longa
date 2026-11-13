@@ -50,8 +50,12 @@ R7. Código de evento fora de I, J, M, L, B.
 R8. Lastro sem codigo_clearing (sem cadastro).
     Basta uma pendência em um dia útil para o lastro todo sair.
 
-Fora da análise e vencendo — o lastro INTEIRO fica fora do tratamento e do
-fluxo final, sem nenhuma alteração, e não recebe nem gera par J + I:
+Títulos públicos, fora da análise e vencendo — o lastro INTEIRO fica fora do
+tratamento e do fluxo final, sem nenhuma alteração, e não recebe nem gera par J + I:
+R14. Título público: alguma posição na janela com indicador_publico_privado = 'U'
+     (coluna titulo_publico = 'S' na query). Separado ANTES de qualquer outra
+     regra (não cai em Fora da Análise, pendência ou vencendo) -> aba
+     "Títulos Públicos".
 R11. tipo_ativo fora da lista configurada (config/filtros.json: tipos que ENTRAM).
 R12. indicador_compromissada = 'S' (cadastro do lastro).
      R11 e R12 vão para a aba "Fora da Análise", com o motivo.
@@ -95,6 +99,7 @@ COL_VENCIMENTO = "data_vencimento"
 COL_ATIVO = "codigo_clearing"
 COL_ORIGEM = "origem_selecao"
 COL_COMPROMISSADA = "indicador_compromissada"
+COL_TITULO_PUBLICO = "titulo_publico"         # 'S' = posição com indicador_publico_privado = 'U'
 COL_DATA_ORIGINAL = "data_evento_original"   # criada quando levar_para_dia_util=True
 COL_MOTIVO = "Motivo"                         # aba Fora da Análise
 
@@ -152,6 +157,7 @@ MARCA_DATA = "data_alterada"
 MARCA_PENDENCIA = "pendencia"
 MARCA_FORA_ANALISE = "fora_analise"
 MARCA_VENCENDO = "vencendo"
+MARCA_TITULO_PUBLICO = "titulo_publico"
 
 COL_LOG_DIA_UTIL = "Dia Útil"
 COLUNAS_LOG = [
@@ -195,6 +201,7 @@ class ResultadoProcessamento:
     fluxo_pendencias: pd.DataFrame = field(default_factory=pd.DataFrame)  # fluxo dos lastros em pendência
     fluxo_fora_analise: pd.DataFrame = field(default_factory=pd.DataFrame)  # tipo fora do filtro / compromissada
     fluxo_vencendo: pd.DataFrame = field(default_factory=pd.DataFrame)      # vencimento dentro do intervalo
+    fluxo_titulos_publicos: pd.DataFrame = field(default_factory=pd.DataFrame)  # posição pública (U)
     filtros: dict = field(default_factory=dict)                             # quais filtros foram aplicados
     validacao_lastros: pd.DataFrame = field(default_factory=pd.DataFrame)
     validacao_consolidada: dict = field(default_factory=dict)
@@ -301,12 +308,25 @@ def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
       - fora da análise: tipo_ativo fora da lista configurada, ou
         indicador_compromissada = 'S';
       - vencendo: data_vencimento dentro do intervalo do evento.
+    Antes de tudo, separa os títulos públicos (titulo_publico = 'S'): eles não
+    entram em nenhuma outra classificação (nem pendência).
     Lastros sem cadastro (sem codigo_clearing) não entram aqui: continuam
     como pendência (R8).
-    Retorna (motivos_fora {lastro: motivo}, lastros_vencendo {set}, filtros {dict}).
+    Retorna (publicos {set}, motivos_fora {lastro: motivo}, lastros_vencendo {set}, filtros {dict}).
     """
-    cadastro = trabalho[trabalho[COL_ATIVO].notna()].drop_duplicates(COL_LASTRO).set_index(COL_LASTRO)
     filtros = {}
+
+    publicos: set = set()
+    if COL_TITULO_PUBLICO in trabalho.columns:
+        flag = trabalho[COL_TITULO_PUBLICO].astype("string").str.strip().str.upper()
+        publicos = set(trabalho.loc[flag == "S", COL_LASTRO])
+        filtros["Separação de títulos públicos"] = "aplicada"
+    else:
+        print(f"ATENÇÃO: a coluna {COL_TITULO_PUBLICO} não veio na query; títulos públicos não foram separados.")
+        filtros["Separação de títulos públicos"] = "NÃO aplicada (coluna ausente)"
+
+    cadastro = (trabalho[trabalho[COL_ATIVO].notna() & ~trabalho[COL_LASTRO].isin(publicos)]
+                .drop_duplicates(COL_LASTRO).set_index(COL_LASTRO))
 
     tipos = None
     if tipos_ativo is not None:
@@ -345,7 +365,7 @@ def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
     else:
         print(f"ATENÇÃO: a coluna {COL_VENCIMENTO} não veio na query; lastros vencendo não foram separados.")
 
-    return motivos_fora, lastros_vencendo, filtros
+    return publicos, motivos_fora, lastros_vencendo, filtros
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +395,10 @@ def processar_eventos(
 
     # --- R11/R12: fora da análise (tipo fora do filtro / compromissada) -----
     # --- R13: lastros vencendo no intervalo ---------------------------------
-    motivos_fora, lastros_vencendo, filtros = _separar_lastros(
+    publicos, motivos_fora, lastros_vencendo, filtros = _separar_lastros(
         trabalho, ini, fim, tipos_ativo, excluir_compromissada)
-    fora_do_tratamento = trabalho[COL_LASTRO].isin(set(motivos_fora) | lastros_vencendo)
+    fora_do_tratamento = trabalho[COL_LASTRO].isin(publicos | set(motivos_fora) | lastros_vencendo)
+    sem_ativo = sem_ativo & ~trabalho[COL_LASTRO].isin(publicos)   # público sem cadastro não é pendência
 
     no_intervalo = trabalho[
         ~vazia & ~fora_do_tratamento & trabalho[COL_DATA].dt.normalize().between(ini, fim)
@@ -534,9 +555,11 @@ def processar_eventos(
     trabalho.loc[trabalho[COL_LASTRO].isin(lastros_pendencia) & ~vazia, _MARCA] = MARCA_PENDENCIA
     trabalho.loc[trabalho[COL_LASTRO].isin(set(motivos_fora)), _MARCA] = MARCA_FORA_ANALISE
     trabalho.loc[trabalho[COL_LASTRO].isin(lastros_vencendo), _MARCA] = MARCA_VENCENDO
+    trabalho.loc[trabalho[COL_LASTRO].isin(publicos), _MARCA] = MARCA_TITULO_PUBLICO
     marcas_antes = trabalho[_MARCA].where(trabalho[_MARCA].notna(), None).tolist()
     trabalho.loc[indices_excluir, _MARCA] = None
-    trabalho.loc[trabalho[_MARCA].isin([MARCA_PENDENCIA, MARCA_FORA_ANALISE, MARCA_VENCENDO]), _MARCA] = None
+    trabalho.loc[trabalho[_MARCA].isin([MARCA_PENDENCIA, MARCA_FORA_ANALISE, MARCA_VENCENDO,
+                                         MARCA_TITULO_PUBLICO]), _MARCA] = None
 
     # --- Fora da análise e vencendo: saem do fluxo final, sem alteração ----
     def _fluxo_bruto(mascara: pd.Series) -> pd.DataFrame:
@@ -548,6 +571,7 @@ def processar_eventos(
     fluxo_fora_analise = _fluxo_bruto(trabalho[COL_LASTRO].isin(set(motivos_fora)))
     fluxo_fora_analise.insert(0, COL_MOTIVO, fluxo_fora_analise[COL_LASTRO].map(motivos_fora))
     fluxo_vencendo = _fluxo_bruto(trabalho[COL_LASTRO].isin(lastros_vencendo))
+    fluxo_titulos_publicos = _fluxo_bruto(trabalho[COL_LASTRO].isin(publicos))
     trabalho = trabalho[~fora_do_tratamento]
     vazia = _eh_linha_vazia(trabalho)
 
@@ -599,6 +623,7 @@ def processar_eventos(
         fluxo_pendencias=fluxo_pendencias,
         fluxo_fora_analise=fluxo_fora_analise,
         fluxo_vencendo=fluxo_vencendo,
+        fluxo_titulos_publicos=fluxo_titulos_publicos,
         filtros=filtros,
         marcas_antes=marcas_antes,
         marcas_depois=marcas_depois,
@@ -699,6 +724,8 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
             resultado.fluxo_fora_analise[COL_LASTRO].nunique() if len(resultado.fluxo_fora_analise) else 0,
         "Lastros vencendo no intervalo (sem atuação)":
             resultado.fluxo_vencendo[COL_LASTRO].nunique() if len(resultado.fluxo_vencendo) else 0,
+        "Títulos públicos (separados)":
+            resultado.fluxo_titulos_publicos[COL_LASTRO].nunique() if len(resultado.fluxo_titulos_publicos) else 0,
         "Lastros no arquivo final": resultado.validacao_consolidada.get("Lastros validados"),
         "Lastros com divergência no percentual de amortização":
             resultado.validacao_consolidada.get("Lastros com divergência"),
