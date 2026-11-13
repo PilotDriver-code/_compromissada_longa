@@ -50,6 +50,15 @@ R7. Código de evento fora de I, J, M, L, B.
 R8. Lastro sem codigo_clearing (sem cadastro).
     Basta uma pendência em um dia útil para o lastro todo sair.
 
+Fora da análise e vencendo — o lastro INTEIRO fica fora do tratamento e do
+fluxo final, sem nenhuma alteração, e não recebe nem gera par J + I:
+R11. tipo_ativo fora da lista configurada (config/filtros.json: tipos que ENTRAM).
+R12. indicador_compromissada = 'S' (cadastro do lastro).
+     R11 e R12 vão para a aba "Fora da Análise", com o motivo.
+R13. data_vencimento dentro do intervalo do evento: lastro vencendo, não é
+     erro e não precisa de atuação -> aba "Lastros Vencendo".
+     Lastros sem cadastro continuam como pendência (R8).
+
 Validação de amortização (após todo o tratamento):
 R10. Para cada lastro do fluxo final, a soma do percentual de TODOS os
      eventos I (fluxo completo) deve ser 100, com tolerância de 0,000001
@@ -85,7 +94,9 @@ COL_TIPO = "tipo_ativo"
 COL_VENCIMENTO = "data_vencimento"
 COL_ATIVO = "codigo_clearing"
 COL_ORIGEM = "origem_selecao"
+COL_COMPROMISSADA = "indicador_compromissada"
 COL_DATA_ORIGINAL = "data_evento_original"   # criada quando levar_para_dia_util=True
+COL_MOTIVO = "Motivo"                         # aba Fora da Análise
 
 COLUNAS_OBRIGATORIAS = [COL_LASTRO, COL_DATA, COL_EVENTO, COL_PERCENTUAL, COL_ATIVO]
 # Colunas que descrevem o evento; todas as outras são dados do lastro (cadastro).
@@ -139,6 +150,8 @@ MARCA_EXCLUIDA = "excluida"
 MARCA_J_ALTERADO = "j_alterado"
 MARCA_DATA = "data_alterada"
 MARCA_PENDENCIA = "pendencia"
+MARCA_FORA_ANALISE = "fora_analise"
+MARCA_VENCENDO = "vencendo"
 
 COL_LOG_DIA_UTIL = "Dia Útil"
 COLUNAS_LOG = [
@@ -180,6 +193,9 @@ class ResultadoProcessamento:
     diagnostico: pd.DataFrame
     pendencias: pd.DataFrame
     fluxo_pendencias: pd.DataFrame = field(default_factory=pd.DataFrame)  # fluxo dos lastros em pendência
+    fluxo_fora_analise: pd.DataFrame = field(default_factory=pd.DataFrame)  # tipo fora do filtro / compromissada
+    fluxo_vencendo: pd.DataFrame = field(default_factory=pd.DataFrame)      # vencimento dentro do intervalo
+    filtros: dict = field(default_factory=dict)                             # quais filtros foram aplicados
     validacao_lastros: pd.DataFrame = field(default_factory=pd.DataFrame)
     validacao_consolidada: dict = field(default_factory=dict)
     resumo: dict = field(default_factory=dict)
@@ -277,6 +293,62 @@ def _nova_linha(modelo: pd.Series, data, evento: str, ordem: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Separação: fora da análise e vencendo
+# ---------------------------------------------------------------------------
+def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
+    """
+    Decide, por lastro, quem NÃO passa pelo tratamento:
+      - fora da análise: tipo_ativo fora da lista configurada, ou
+        indicador_compromissada = 'S';
+      - vencendo: data_vencimento dentro do intervalo do evento.
+    Lastros sem cadastro (sem codigo_clearing) não entram aqui: continuam
+    como pendência (R8).
+    Retorna (motivos_fora {lastro: motivo}, lastros_vencendo {set}, filtros {dict}).
+    """
+    cadastro = trabalho[trabalho[COL_ATIVO].notna()].drop_duplicates(COL_LASTRO).set_index(COL_LASTRO)
+    filtros = {}
+
+    tipos = None
+    if tipos_ativo is not None:
+        if COL_TIPO not in trabalho.columns:
+            raise ValueError(f"Filtro de tipos configurado, mas a coluna {COL_TIPO} não veio na query.")
+        tipos = {str(t).strip() for t in tipos_ativo}
+        filtros["Filtro de tipos de ativo"] = f"aplicado ({', '.join(sorted(tipos))})"
+    else:
+        filtros["Filtro de tipos de ativo"] = "não aplicado"
+
+    aplicar_compromissada = excluir_compromissada and COL_COMPROMISSADA in trabalho.columns
+    if excluir_compromissada and not aplicar_compromissada:
+        print(f"ATENÇÃO: a coluna {COL_COMPROMISSADA} não veio na query; "
+              "o filtro de compromissada NÃO foi aplicado.")
+    filtros["Filtro de compromissada"] = ("aplicado" if aplicar_compromissada
+                                          else "NÃO aplicado (coluna ausente)" if excluir_compromissada
+                                          else "não aplicado")
+
+    motivos_fora: dict = {}
+    for lastro, linha in cadastro.iterrows():
+        motivos = []
+        if tipos is not None:
+            tipo = linha[COL_TIPO]
+            if pd.isna(tipo) or str(tipo).strip() not in tipos:
+                motivos.append(f"tipo_ativo '{tipo}' fora do filtro")
+        if aplicar_compromissada and str(linha[COL_COMPROMISSADA]).strip().upper() == "S":
+            motivos.append("compromissada (indicador_compromissada = S)")
+        if motivos:
+            motivos_fora[lastro] = "; ".join(motivos)
+
+    lastros_vencendo: set = set()
+    if COL_VENCIMENTO in trabalho.columns:
+        venc = pd.to_datetime(cadastro[COL_VENCIMENTO], errors="coerce").dt.normalize()
+        no_intervalo = venc.between(ini, fim) & ~venc.index.isin(list(motivos_fora))
+        lastros_vencendo = set(venc.index[no_intervalo])
+    else:
+        print(f"ATENÇÃO: a coluna {COL_VENCIMENTO} não veio na query; lastros vencendo não foram separados.")
+
+    return motivos_fora, lastros_vencendo, filtros
+
+
+# ---------------------------------------------------------------------------
 # Processamento
 # ---------------------------------------------------------------------------
 def processar_eventos(
@@ -285,6 +357,8 @@ def processar_eventos(
     data_final,
     calendario: Calendario | None = None,
     levar_para_dia_util: bool = True,
+    tipos_ativo: list[str] | None = None,
+    excluir_compromissada: bool = True,
 ) -> ResultadoProcessamento:
     ini = pd.Timestamp(data_inicial).normalize()
     fim = pd.Timestamp(data_final).normalize()
@@ -299,8 +373,14 @@ def processar_eventos(
     vazia = _eh_linha_vazia(trabalho)
     sem_ativo = trabalho[COL_ATIVO].isna()
 
+    # --- R11/R12: fora da análise (tipo fora do filtro / compromissada) -----
+    # --- R13: lastros vencendo no intervalo ---------------------------------
+    motivos_fora, lastros_vencendo, filtros = _separar_lastros(
+        trabalho, ini, fim, tipos_ativo, excluir_compromissada)
+    fora_do_tratamento = trabalho[COL_LASTRO].isin(set(motivos_fora) | lastros_vencendo)
+
     no_intervalo = trabalho[
-        ~vazia & trabalho[COL_DATA].dt.normalize().between(ini, fim)
+        ~vazia & ~fora_do_tratamento & trabalho[COL_DATA].dt.normalize().between(ini, fim)
     ].copy()
     mapa_dia_util = {d: calendario.proximo_dia_util(d) for d in no_intervalo[COL_DATA].dt.normalize().unique()}
     no_intervalo[_DIA_UTIL] = no_intervalo[COL_DATA].dt.normalize().map(mapa_dia_util)
@@ -407,7 +487,7 @@ def processar_eventos(
 
     # --- R5: lastro irmão sem evento no dia útil -----------------------------
     lastros_por_ativo = (
-        trabalho[~sem_ativo].sort_values(_ORDEM)
+        trabalho[~sem_ativo & ~fora_do_tratamento].sort_values(_ORDEM)
         .groupby(COL_ATIVO, sort=False)[COL_LASTRO].unique()
     )
     proxima_ordem = float(len(trabalho))
@@ -452,9 +532,24 @@ def processar_eventos(
     for idx in indices_excluir:
         trabalho.loc[idx, _MARCA] = MARCA_EXCLUIDA
     trabalho.loc[trabalho[COL_LASTRO].isin(lastros_pendencia) & ~vazia, _MARCA] = MARCA_PENDENCIA
+    trabalho.loc[trabalho[COL_LASTRO].isin(set(motivos_fora)), _MARCA] = MARCA_FORA_ANALISE
+    trabalho.loc[trabalho[COL_LASTRO].isin(lastros_vencendo), _MARCA] = MARCA_VENCENDO
     marcas_antes = trabalho[_MARCA].where(trabalho[_MARCA].notna(), None).tolist()
     trabalho.loc[indices_excluir, _MARCA] = None
-    trabalho.loc[trabalho[_MARCA] == MARCA_PENDENCIA, _MARCA] = None
+    trabalho.loc[trabalho[_MARCA].isin([MARCA_PENDENCIA, MARCA_FORA_ANALISE, MARCA_VENCENDO]), _MARCA] = None
+
+    # --- Fora da análise e vencendo: saem do fluxo final, sem alteração ----
+    def _fluxo_bruto(mascara: pd.Series) -> pd.DataFrame:
+        return (trabalho[mascara]
+                .sort_values([COL_ATIVO, COL_LASTRO, COL_DATA, _ORDEM], kind="stable", na_position="last")
+                .drop(columns=[_ORDEM, _MARCA, COL_DATA_ORIGINAL])
+                .reset_index(drop=True))
+
+    fluxo_fora_analise = _fluxo_bruto(trabalho[COL_LASTRO].isin(set(motivos_fora)))
+    fluxo_fora_analise.insert(0, COL_MOTIVO, fluxo_fora_analise[COL_LASTRO].map(motivos_fora))
+    fluxo_vencendo = _fluxo_bruto(trabalho[COL_LASTRO].isin(lastros_vencendo))
+    trabalho = trabalho[~fora_do_tratamento]
+    vazia = _eh_linha_vazia(trabalho)
 
     # --- Lastros em pendência: saem do fluxo final, sem nenhuma alteração ---
     em_pend = trabalho[COL_LASTRO].isin(lastros_pendencia)
@@ -502,6 +597,9 @@ def processar_eventos(
         diagnostico=df_diag,
         pendencias=pendencias,
         fluxo_pendencias=fluxo_pendencias,
+        fluxo_fora_analise=fluxo_fora_analise,
+        fluxo_vencendo=fluxo_vencendo,
+        filtros=filtros,
         marcas_antes=marcas_antes,
         marcas_depois=marcas_depois,
     )
@@ -597,10 +695,15 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
         "Pares J + I incluídos": contar(TIPO_INCLUSAO, "Evento Final", EVENTO_J, LASTRO_SEM_EVENTO),
         "Lastros sem necessidade de alteração": len(todos - com_acao - com_pendencia),
         "Lastros com pendência (fora do arquivo final)": len(com_pendencia),
+        "Lastros fora da análise (tipo de ativo / compromissada)":
+            resultado.fluxo_fora_analise[COL_LASTRO].nunique() if len(resultado.fluxo_fora_analise) else 0,
+        "Lastros vencendo no intervalo (sem atuação)":
+            resultado.fluxo_vencendo[COL_LASTRO].nunique() if len(resultado.fluxo_vencendo) else 0,
         "Lastros no arquivo final": resultado.validacao_consolidada.get("Lastros validados"),
         "Lastros com divergência no percentual de amortização":
             resultado.validacao_consolidada.get("Lastros com divergência"),
         "Validação consolidada de amortização": resultado.validacao_consolidada.get("Status"),
+        **resultado.filtros,
     }
 
 
@@ -609,10 +712,16 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
 # ---------------------------------------------------------------------------
 def executar(df_query: pd.DataFrame, data_inicial, data_final,
              calendario: Calendario | None = None,
-             levar_para_dia_util: bool = True) -> ResultadoProcessamento:
-    """preparar -> processar -> resumo."""
+             levar_para_dia_util: bool = True,
+             tipos_ativo: list[str] | None = None,
+             excluir_compromissada: bool = True) -> ResultadoProcessamento:
+    """
+    preparar -> processar -> validar -> resumo.
+    tipos_ativo: lista dos tipos que ENTRAM na análise (None = sem filtro).
+    """
     dados = preparar_dados(df_query)
-    resultado = processar_eventos(dados, data_inicial, data_final, calendario, levar_para_dia_util)
+    resultado = processar_eventos(dados, data_inicial, data_final, calendario, levar_para_dia_util,
+                                  tipos_ativo, excluir_compromissada)
     resultado.validacao_lastros, resultado.validacao_consolidada = validar_amortizacoes(
         resultado.fluxo_tratado, dados)
     resultado.resumo = gerar_resumo(resultado)
