@@ -22,19 +22,23 @@ lastros_com_evento AS (
 ),
 
 -- 2) Lastros com posição na janela D-7 a D-1
+--    titulo_publico = 'S' se o lastro tiver alguma posição com
+--    indicador_publico_privado = 'U' (uma linha por lastro: não duplica o fluxo)
 lastros_com_posicao AS (
-    SELECT DISTINCT
+    SELECT
         posicao.codigo_ativo_lastro AS codigo_lastro,
-        posicao.sigla_sistema_origem
+        posicao.sigla_sistema_origem,
+        MAX(CASE WHEN posicao.indicador_publico_privado = 'U' THEN 'S' ELSE 'N' END) AS titulo_publico
     FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_posicao_fundo_renda_fixa posicao
     WHERE posicao.sigla_sistema_origem = 'LZ'
       AND posicao.data_posicao >= TIMESTAMP '{posicao_de} 00:00:00'
       AND posicao.data_posicao <  TIMESTAMP '{posicao_ate_exclusivo} 00:00:00'
+    GROUP BY posicao.codigo_ativo_lastro, posicao.sigla_sistema_origem
 ),
 
 -- 3) Lastros base: têm evento no intervalo E têm posição
 lastros_base AS (
-    SELECT e.codigo_lastro, e.sigla_sistema_origem
+    SELECT e.codigo_lastro, e.sigla_sistema_origem, p.titulo_publico
     FROM lastros_com_evento e
     INNER JOIN lastros_com_posicao p
             ON p.codigo_lastro        = e.codigo_lastro
@@ -57,7 +61,8 @@ ativos_base AS (
 lastros_irmaos AS (
     SELECT DISTINCT
         cad.codigo_lastro,
-        cad.sigla_sistema_origem
+        cad.sigla_sistema_origem,
+        p.titulo_publico
     FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad
     INNER JOIN ativos_base a
             ON a.codigo_clearing      = cad.codigo_clearing
@@ -75,10 +80,10 @@ lastros_irmaos AS (
 
 -- 6) Todos os lastros que entram na análise
 lastros_selecionados AS (
-    SELECT codigo_lastro, sigla_sistema_origem, 'EVENTO_NO_INTERVALO' AS origem_selecao
+    SELECT codigo_lastro, sigla_sistema_origem, titulo_publico, 'EVENTO_NO_INTERVALO' AS origem_selecao
     FROM lastros_base
     UNION ALL
-    SELECT codigo_lastro, sigla_sistema_origem, 'IRMAO_SEM_EVENTO' AS origem_selecao
+    SELECT codigo_lastro, sigla_sistema_origem, titulo_publico, 'IRMAO_SEM_EVENTO' AS origem_selecao
     FROM lastros_irmaos
 )
 
@@ -93,6 +98,7 @@ SELECT
     cad_lastro.data_vencimento,
     cad_lastro.codigo_clearing,
     cad_lastro.indicador_compromissada,
+    sel.titulo_publico,
     sel.origem_selecao
 FROM lastros_selecionados sel
 LEFT JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_evento_renda_fixa ev
