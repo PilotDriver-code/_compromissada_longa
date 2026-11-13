@@ -133,9 +133,10 @@ def gerar_excels(
         tf.MARCA_PENDENCIA: PatternFill("solid", fgColor="D9D9D9"),   # cinza
         tf.MARCA_FORA_ANALISE: PatternFill("solid", fgColor="E4DFEC"),  # lilás
         tf.MARCA_VENCENDO: PatternFill("solid", fgColor="FCE4D6"),      # laranja
+        tf.MARCA_TITULO_PUBLICO: PatternFill("solid", fgColor="DAEEF3"),  # azul-claro
     }
     legenda = pd.DataFrame({
-        "Cor": ["Verde", "Amarelo", "Azul", "Vermelho", "Cinza", "Lilás", "Laranja"],
+        "Cor": ["Verde", "Amarelo", "Azul", "Vermelho", "Cinza", "Lilás", "Laranja", "Azul-claro"],
         "Significado": [
             "Linha incluída pela rotina (I, ou J + I de lastro sem evento)",
             f"J com percentual alterado para {MINIMO_TXT} (a data também pode ter ido para o dia útil — ver log)",
@@ -147,6 +148,8 @@ def gerar_excels(
             "Lastro fora da análise: tipo de ativo fora do filtro ou compromissada (ver aba Fora da Análise) "
             "— só aparece no arquivo ANTES",
             "Lastro vencendo no intervalo: sem atuação (ver aba Lastros Vencendo) — só aparece no arquivo ANTES",
+            "Título público (posição U): fora do tratamento (ver aba Títulos Públicos) "
+            "— só aparece no arquivo ANTES",
         ],
     })
 
@@ -169,6 +172,7 @@ def gerar_excels(
         _escrever_aba(excel, resultado.fluxo_pendencias, "Fluxo Pendências")
         _escrever_aba(excel, resultado.fluxo_vencendo, "Lastros Vencendo")
         _escrever_aba(excel, resultado.fluxo_fora_analise, "Fora da Análise")
+        _escrever_aba(excel, resultado.fluxo_titulos_publicos, "Títulos Públicos")
         _escrever_aba(excel, resultado.log_alteracoes, "Log de Alterações")
         _escrever_aba(excel, resultado.diagnostico, "Diagnóstico")
         _escrever_aba(excel, pd.DataFrame(list(resultado.resumo.items()), columns=["Item", "Valor"]), "Resumo")
