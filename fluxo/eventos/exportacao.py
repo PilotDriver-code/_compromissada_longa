@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from eventos import tratamento_fluxo as tf
@@ -204,3 +205,81 @@ def gerar_excels(
         _escrever_aba(excel, legenda, "Legenda")
 
     return caminho_antes.resolve(), caminho_depois.resolve(), resultado
+
+
+# ---------------------------------------------------------------------------
+# Arquivo TXT de upload (só o Fluxo Tratado)
+# ---------------------------------------------------------------------------
+TXT_SEPARADOR = "\t"
+TXT_QUEBRA_LINHA = "\r\n"          # Windows (CRLF)
+TXT_CODIFICACAO = "utf-8"
+TXT_PRIMEIRA_COLUNA = "E"
+TXT_FORMATO_DATA = "%d/%m/%Y"
+
+
+def _txt_lastro(valor) -> str:
+    """Código do lastro como texto (sem '.0' se vier numérico)."""
+    if isinstance(valor, (float, np.floating)) and float(valor).is_integer():
+        return str(int(valor))
+    return str(valor).strip()
+
+
+def _txt_percentual(valor) -> str:
+    """
+    Percentual com ponto decimal. O mínimo sai em notação científica (ex.: 1e-14),
+    como o sistema espera; os demais em decimal comum, sem zeros sobrando
+    (100, 0.48, 0.486755057).
+    """
+    numero = float(valor)
+    if numero == tf.PERCENTUAL_MINIMO:
+        return repr(tf.PERCENTUAL_MINIMO)
+    return np.format_float_positional(numero, trim="-")
+
+
+def linhas_txt(fluxo: pd.DataFrame) -> list[str]:
+    """Uma linha por evento: E, lastro, data, sigla do evento, percentual (sem cabeçalho)."""
+    return [
+        TXT_SEPARADOR.join([
+            TXT_PRIMEIRA_COLUNA,
+            _txt_lastro(lastro),
+            pd.Timestamp(data).strftime(TXT_FORMATO_DATA),
+            str(evento).strip(),
+            _txt_percentual(percentual),
+        ])
+        for lastro, data, evento, percentual in zip(
+            fluxo[tf.COL_LASTRO], fluxo[tf.COL_DATA], fluxo[tf.COL_EVENTO], fluxo[tf.COL_PERCENTUAL])
+    ]
+
+
+def gerar_arquivos_upload(
+    resultado: tf.ResultadoProcessamento,
+    data_inicial,
+    data_final,
+    pasta_upload: str | Path,
+) -> list[Path]:
+    """
+    Gera o TXT de upload a partir do Fluxo Tratado (fluxo completo dos lastros
+    com alteração). Um arquivo por base (sigla_sistema_origem), cada um na
+    sua pasta:  <pasta_upload>/<BASE>/fluxo_<BASE>_<ini>_a_<fim>.txt
+    Sem lastros tratados, nenhum arquivo é gerado.
+    """
+    fluxo = resultado.fluxo_tratado
+    if fluxo.empty:
+        return []
+
+    sufixo = f"{pd.Timestamp(data_inicial):%Y-%m-%d}_a_{pd.Timestamp(data_final):%Y-%m-%d}"
+    if tf.COL_SISTEMA in fluxo.columns:
+        bases = fluxo[tf.COL_SISTEMA].fillna("SEM_BASE").astype(str).str.strip().replace("", "SEM_BASE")
+    else:
+        bases = pd.Series("SEM_BASE", index=fluxo.index)
+
+    caminhos = []
+    for base, parte in fluxo.groupby(bases, sort=True):
+        pasta = Path(pasta_upload) / base
+        pasta.mkdir(parents=True, exist_ok=True)
+        caminho = pasta / f"fluxo_{base}_{sufixo}.txt"
+        conteudo = TXT_QUEBRA_LINHA.join(linhas_txt(parte)) + TXT_QUEBRA_LINHA
+        with open(caminho, "w", encoding=TXT_CODIFICACAO, newline="") as arquivo:
+            arquivo.write(conteudo)
+        caminhos.append(caminho.resolve())
+    return caminhos
