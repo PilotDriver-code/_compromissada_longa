@@ -23,7 +23,7 @@ import pyodbc                                   # noqa: E402
 from bizdays import Calendar                    # noqa: E402
 
 from aws.query_eventos import QUERY_EVENTOS     # noqa: E402
-from eventos.exportacao import formatar_resumo_terminal, gerar_excels   # noqa: E402
+from eventos.exportacao import formatar_resumo_terminal, gerar_arquivos_upload, gerar_excels   # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -32,7 +32,8 @@ from eventos.exportacao import formatar_resumo_terminal, gerar_excels   # noqa: 
 DATA_INICIAL = "2026-11-10"
 DATA_FINAL = "2026-11-10"
 
-PASTA_SAIDA = RAIZ_PROJETO / "saida"
+PASTA_SAIDA = RAIZ_PROJETO / "saida"                 # Excel ANTES e DEPOIS
+PASTA_UPLOAD = RAIZ_PROJETO / "upload"               # TXT para o sistema (uma subpasta por base)
 ARQUIVO_FILTROS = RAIZ_PROJETO / "config" / "filtros.json"   # tipos de ativo que ENTRAM na análise
 DSN_ATHENA = "AWS Athena ODBC"
 DIAS_UTEIS_POSICAO = 7   # janela de posição: D-7 até D-1
@@ -143,10 +144,17 @@ def rodar(data_inicial: str, data_final: str):
         levar_para_dia_util=LEVAR_PARA_DIA_UTIL, tipos_ativo=tipos_ativo, info_execucao=info_execucao,
     )
 
+    arquivos_upload = gerar_arquivos_upload(resultado, data_inicial, data_final, PASTA_UPLOAD)
+
     print()
     print(formatar_resumo_terminal(resultado, info_execucao))
     print(f"\nExcel ANTES : {caminho_antes}")
     print(f"Excel DEPOIS: {caminho_depois}")
+    if arquivos_upload:
+        for caminho in arquivos_upload:
+            print(f"TXT upload  : {caminho}")
+    else:
+        print("TXT upload  : não gerado (nenhum lastro no Fluxo Tratado)")
     return resultado
 
 
