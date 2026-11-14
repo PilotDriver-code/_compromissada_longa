@@ -47,7 +47,7 @@ Pendências — o lastro INTEIRO fica fora do fluxo final, sem nenhuma
 alteração (nem data), e não recebe par J + I como irmão:
 R6. Evento repetido no mesmo grupo (não deveria ocorrer: erro de dados).
 R7. Código de evento fora de I, J, M, L, B.
-R8. Lastro sem codigo_clearing (sem cadastro).
+R8. Lastro sem codigo_clearing (sem cadastro) ou com codigo_clearing = 0.
     Basta uma pendência em um dia útil para o lastro todo sair.
 
 Títulos públicos, fora da análise e vencendo — o lastro INTEIRO fica fora do
@@ -57,8 +57,10 @@ R14. Título público: alguma posição na janela com indicador_publico_privado 
      regra (não cai em Fora da Análise, pendência ou vencendo) -> aba
      "Títulos Públicos".
 R11. tipo_ativo fora da lista configurada (config/filtros.json: tipos que ENTRAM).
+     Os valores aceitam '%' como no LIKE do SQL ('CRI%', '%CRI%'); sem '%' é
+     exato. Maiúsculas/minúsculas são ignoradas.
 R12. indicador_compromissada = 'S' (cadastro do lastro).
-     R11 e R12 vão para a aba "Fora da Análise", com o motivo.
+     R11 vai para a aba "Fora da Análise"; R12 para a aba "Compromissadas".
 R13. data_vencimento dentro do intervalo do evento: lastro vencendo, não é
      erro e não precisa de atuação -> aba "Lastros Vencendo".
      Lastros sem cadastro continuam como pendência (R8).
@@ -81,6 +83,7 @@ Saída:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -207,6 +210,7 @@ class ResultadoProcessamento:
     fluxo_vencendo: pd.DataFrame = field(default_factory=pd.DataFrame)      # vencimento dentro do intervalo
     fluxo_titulos_publicos: pd.DataFrame = field(default_factory=pd.DataFrame)  # posição pública (U)
     filtros: dict = field(default_factory=dict)                             # quais filtros foram aplicados
+    tipos_encontrados: dict = field(default_factory=dict)  # {"entraram": {tipo: (padrão, qtd)}, "fora": {tipo: qtd}}
     validacao_lastros: pd.DataFrame = field(default_factory=pd.DataFrame)
     validacao_consolidada: dict = field(default_factory=dict)
     resumo: dict = field(default_factory=dict)
@@ -223,6 +227,34 @@ class ResultadoProcessamento:
 # ---------------------------------------------------------------------------
 # Preparação
 # ---------------------------------------------------------------------------
+def _padrao_tipo(padrao: str) -> re.Pattern:
+    """
+    Converte um padrão do filtros.json em regex, como o LIKE do SQL:
+    '%' = qualquer sequência de caracteres (inclusive nenhuma). Sem '%', é exato.
+    Maiúsculas e minúsculas são ignoradas. Ex.: 'CRI%', '%CRI', '%CRI%'.
+    """
+    partes = [re.escape(p) for p in str(padrao).strip().split("%")]
+    return re.compile("^" + ".*".join(partes) + "$", re.IGNORECASE)
+
+
+def _tipo_casa(tipo, padroes: list[tuple[str, re.Pattern]]) -> str | None:
+    """Devolve o primeiro padrão do filtros.json que casa com o tipo, ou None."""
+    if tipo is None or pd.isna(tipo):
+        return None
+    texto = str(tipo).strip()
+    return next((origem for origem, regex in padroes if regex.match(texto)), None)
+
+
+def _clearing_invalido(serie: pd.Series) -> pd.Series:
+    """
+    codigo_clearing sem cadastro válido: vazio, em branco ou zero
+    ("0", "00", "0.0", 0). Um código que só COMEÇA com zero não entra aqui.
+    """
+    texto = serie.astype("string").str.strip()
+    zero = texto.str.fullmatch(r"0+(\.0+)?").fillna(False).astype(bool)
+    return (texto.isna() | texto.eq("").fillna(False) | zero).astype(bool)
+
+
 def _eh_linha_vazia(df: pd.DataFrame) -> pd.Series:
     """Linha de lastro sem nenhum evento (vem da query só com dados de cadastro)."""
     return df[COLUNAS_DO_EVENTO].isna().all(axis=1)
@@ -332,7 +364,7 @@ def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
         print(f"ATENÇÃO: a coluna {COL_TITULO_PUBLICO} não veio na query; títulos públicos não foram separados.")
         filtros["Separação de títulos públicos"] = "NÃO aplicada (coluna ausente)"
 
-    cadastro = (trabalho[trabalho[COL_ATIVO].notna() & ~trabalho[COL_LASTRO].isin(publicos)]
+    cadastro = (trabalho[~_clearing_invalido(trabalho[COL_ATIVO]) & ~trabalho[COL_LASTRO].isin(publicos)]
                 .drop_duplicates(COL_LASTRO).set_index(COL_LASTRO))
 
     aplicar_compromissada = excluir_compromissada and COL_COMPROMISSADA in trabalho.columns
@@ -348,14 +380,30 @@ def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
         compromissadas = set(cadastro.index[flag == "S"])
 
     fora_tipo: set = set()
+    tipos_encontrados: dict = {}
     if tipos_ativo is not None:
         if COL_TIPO not in trabalho.columns:
             raise ValueError(f"Filtro de tipos configurado, mas a coluna {COL_TIPO} não veio na query.")
-        tipos = {str(t).strip() for t in tipos_ativo}
-        filtros["Filtro de tipos de ativo"] = f"aplicado ({', '.join(sorted(tipos))})"
-        tipo_lastro = cadastro[COL_TIPO].astype("string").str.strip()
-        fora = tipo_lastro.isna() | ~tipo_lastro.isin(tipos)
-        fora_tipo = set(cadastro.index[fora]) - compromissadas
+        origens = [str(t).strip() for t in tipos_ativo if str(t).strip()]
+        padroes = [(origem, _padrao_tipo(origem)) for origem in origens]
+        filtros["Filtro de tipos de ativo"] = f"aplicado ({', '.join(origens)})"
+
+        avaliados = cadastro[~cadastro.index.isin(list(compromissadas))]
+        casou = {lastro: _tipo_casa(tipo, padroes) for lastro, tipo in avaliados[COL_TIPO].items()}
+        fora_tipo = {lastro for lastro, padrao in casou.items() if padrao is None}
+
+        # Para o resumo: quais tipos entraram (e por qual padrão) e quais ficaram de fora
+        entraram: dict = {}
+        fora: dict = {}
+        for lastro, padrao in casou.items():
+            tipo = avaliados.at[lastro, COL_TIPO]
+            nome = "(vazio)" if pd.isna(tipo) else str(tipo).strip()
+            if padrao is None:
+                fora[nome] = fora.get(nome, 0) + 1
+            else:
+                qtd = entraram.get(nome, (padrao, 0))[1]
+                entraram[nome] = (padrao, qtd + 1)
+        tipos_encontrados = {"entraram": dict(sorted(entraram.items())), "fora": dict(sorted(fora.items()))}
     else:
         filtros["Filtro de tipos de ativo"] = "não aplicado"
 
@@ -366,7 +414,7 @@ def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
     else:
         print(f"ATENÇÃO: a coluna {COL_VENCIMENTO} não veio na query; lastros vencendo não foram separados.")
 
-    return publicos, compromissadas, fora_tipo, vencendo, filtros
+    return publicos, compromissadas, fora_tipo, vencendo, filtros, tipos_encontrados
 
 
 # ---------------------------------------------------------------------------
@@ -392,10 +440,10 @@ def processar_eventos(
     trabalho[_MARCA] = None
     trabalho[COL_DATA_ORIGINAL] = trabalho[COL_DATA]
     vazia = _eh_linha_vazia(trabalho)
-    sem_ativo = trabalho[COL_ATIVO].isna()
+    sem_ativo = _clearing_invalido(trabalho[COL_ATIVO])   # vazio ou zero (R8)
 
     # --- R14, R12, R11, R13: públicos, compromissadas, tipo fora, vencendo ---
-    publicos, compromissadas, fora_tipo, lastros_vencendo, filtros = _separar_lastros(
+    publicos, compromissadas, fora_tipo, lastros_vencendo, filtros, tipos_encontrados = _separar_lastros(
         trabalho, ini, fim, tipos_ativo, excluir_compromissada)
     fora_do_tratamento = trabalho[COL_LASTRO].isin(publicos | compromissadas | fora_tipo | lastros_vencendo)
     sem_ativo = sem_ativo & ~trabalho[COL_LASTRO].isin(publicos)   # público sem cadastro não é pendência
@@ -413,19 +461,22 @@ def processar_eventos(
     log: list[dict] = []
     diagnostico: list[dict] = []
 
-    # --- R8: lastros sem codigo_clearing -> pendência, sem alteração --------
-    for lastro, _ in trabalho[sem_ativo].groupby(COL_LASTRO, sort=False):
+    # --- R8: lastros sem codigo_clearing (vazio ou zero) -> pendência -----
+    for lastro, linhas in trabalho[sem_ativo].groupby(COL_LASTRO, sort=False):
         ev = no_intervalo[no_intervalo[COL_LASTRO] == lastro]
+        clearing = linhas[COL_ATIVO].iloc[0]
+        motivo = ("Lastro sem codigo_clearing (sem cadastro)" if pd.isna(clearing) or str(clearing).strip() == ""
+                  else f"Lastro com codigo_clearing = {str(clearing).strip()} (sem cadastro válido)")
         diagnostico.append({
-            COL_ATIVO: None, COL_LASTRO: lastro, COL_LOG_DIA_UTIL: None,
+            COL_ATIVO: clearing, COL_LASTRO: lastro, COL_LOG_DIA_UTIL: None,
             "Datas Cadastradas": _datas_txt(ev[COL_DATA]),
             "Eventos Originais": "+".join(sorted(ev[COL_EVENTO])),
             "Eventos Finais": "+".join(sorted(ev[COL_EVENTO])),
             "Caso": PENDENCIA, "Ações": "nenhuma",
-            "Observação": "Lastro sem codigo_clearing (sem cadastro)",
+            "Observação": motivo,
         })
 
-    grupos_validos = no_intervalo[no_intervalo[COL_ATIVO].notna()]
+    grupos_validos = no_intervalo[~_clearing_invalido(no_intervalo[COL_ATIVO])]
 
     # --- Pendência vale para o lastro INTEIRO: ele sai do fluxo final -------
     lastros_pendencia: set = set(trabalho.loc[sem_ativo, COL_LASTRO])
@@ -663,6 +714,7 @@ def processar_eventos(
         fluxo_vencendo=fluxo_vencendo,
         fluxo_titulos_publicos=fluxo_titulos_publicos,
         filtros=filtros,
+        tipos_encontrados=tipos_encontrados,
         marcas_antes=marcas_antes,
         marcas_depois=marcas_depois,
     )
@@ -785,6 +837,21 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
             "Validação consolidada": validacao.get("Status"),
         },
         "Filtros": dict(resultado.filtros),
+        **_secoes_tipos(resultado.tipos_encontrados),
+    }
+
+
+def _secoes_tipos(tipos_encontrados: dict) -> dict:
+    """Seções do resumo com os tipos encontrados (só quando o filtro de tipos foi aplicado)."""
+    if not tipos_encontrados:
+        return {}
+    plural = lambda n: f"{n} lastro" + ("s" if n != 1 else "")
+    entraram = {tipo: f"pelo padrão '{padrao}' ({plural(qtd)})"
+                for tipo, (padrao, qtd) in tipos_encontrados["entraram"].items()}
+    fora = {tipo: plural(qtd) for tipo, qtd in tipos_encontrados["fora"].items()}
+    return {
+        "Tipos que entraram": entraram or {"(nenhum)": ""},
+        "Tipos fora da análise": fora or {"(nenhum)": ""},
     }
 
 
@@ -807,5 +874,3 @@ def executar(df_query: pd.DataFrame, data_inicial, data_final,
         resultado.fluxo_tratado, dados, fluxo_sem_alteracao=resultado.fluxo_sem_alteracao)
     resultado.resumo = gerar_resumo(resultado)
     return resultado
-
-
