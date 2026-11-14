@@ -102,6 +102,27 @@ def _escrever_validacoes(excel, consolidado: dict, por_lastro: pd.DataFrame, cor
         ws.auto_filter.ref = f"A{linha_cab}:{get_column_letter(len(por_lastro.columns))}{ultima}"
 
 
+def resumo_em_linhas(resultado: tf.ResultadoProcessamento, info_execucao: dict | None = None) -> list[tuple]:
+    """Resumo como lista de (seção, item, valor): base do terminal e da aba Resumo."""
+    linhas = [("Execução", item, valor) for item, valor in (info_execucao or {}).items()]
+    for secao, itens in resultado.resumo.items():
+        linhas += [(secao, item, valor) for item, valor in itens.items()]
+    return linhas
+
+
+def formatar_resumo_terminal(resultado: tf.ResultadoProcessamento, info_execucao: dict | None = None) -> str:
+    """Resumo pronto para imprimir no terminal (ou mostrar numa tela)."""
+    linhas = resumo_em_linhas(resultado, info_execucao)
+    largura = max(len(str(item)) for _, item, _ in linhas) + 3
+    saida, secao_atual = ["=" * 60, "RESUMO DO PROCESSAMENTO", "=" * 60], None
+    for secao, item, valor in linhas:
+        if secao != secao_atual:
+            saida.append(f"\n{secao.upper()}")
+            secao_atual = secao
+        saida.append(f"  {str(item).ljust(largura, '.')} {valor}")
+    return "\n".join(saida)
+
+
 def gerar_excels(
     df_query: pd.DataFrame,
     data_inicial,
@@ -110,13 +131,15 @@ def gerar_excels(
     levar_para_dia_util: bool = True,
     tipos_ativo: list[str] | None = None,
     excluir_compromissada: bool = True,
+    info_execucao: dict | None = None,
 ) -> tuple[Path, Path, tf.ResultadoProcessamento]:
     """
     Aplica o tratamento ao DataFrame da query e salva:
         fluxo_ANTES_<ini>_a_<fim>.xlsx  -> dados como vieram da query
-        fluxo_DEPOIS_<ini>_a_<fim>.xlsx -> fluxo final + validações, pendências, vencendo,
-                                           fora da análise, log, diagnóstico, resumo
+        fluxo_DEPOIS_<ini>_a_<fim>.xlsx -> fluxo tratado, fluxo sem alteração, validações e as
+                                           abas dos lastros separados, log, diagnóstico, resumo
     tipos_ativo: lista dos tipos que ENTRAM na análise (None = sem filtro).
+    info_execucao: itens extras para o topo do resumo (período, janela de posição, tipos...).
     Retorna (caminho_antes, caminho_depois, resultado).
     """
     from openpyxl.styles import PatternFill
@@ -126,32 +149,31 @@ def gerar_excels(
                             tipos_ativo=tipos_ativo, excluir_compromissada=excluir_compromissada)
 
     cores = {
-        tf.MARCA_INCLUIDA: PatternFill("solid", fgColor="C6EFCE"),    # verde
-        tf.MARCA_J_ALTERADO: PatternFill("solid", fgColor="FFEB9C"),  # amarelo
-        tf.MARCA_DATA: PatternFill("solid", fgColor="BDD7EE"),        # azul
-        tf.MARCA_EXCLUIDA: PatternFill("solid", fgColor="FFC7CE"),    # vermelho
-        tf.MARCA_PENDENCIA: PatternFill("solid", fgColor="D9D9D9"),   # cinza
-        tf.MARCA_FORA_ANALISE: PatternFill("solid", fgColor="E4DFEC"),  # lilás
-        tf.MARCA_VENCENDO: PatternFill("solid", fgColor="FCE4D6"),      # laranja
+        tf.MARCA_INCLUIDA: PatternFill("solid", fgColor="C6EFCE"),        # verde
+        tf.MARCA_J_ALTERADO: PatternFill("solid", fgColor="FFEB9C"),      # amarelo
+        tf.MARCA_DATA: PatternFill("solid", fgColor="BDD7EE"),            # azul
+        tf.MARCA_EXCLUIDA: PatternFill("solid", fgColor="FFC7CE"),        # vermelho
+        tf.MARCA_PENDENCIA: PatternFill("solid", fgColor="D9D9D9"),       # cinza
+        tf.MARCA_COMPROMISSADA: PatternFill("solid", fgColor="F2CEEF"),   # rosa
+        tf.MARCA_FORA_ANALISE: PatternFill("solid", fgColor="E4DFEC"),    # lilás
+        tf.MARCA_VENCENDO: PatternFill("solid", fgColor="FCE4D6"),        # laranja
         tf.MARCA_TITULO_PUBLICO: PatternFill("solid", fgColor="DAEEF3"),  # azul-claro
     }
-    legenda = pd.DataFrame({
-        "Cor": ["Verde", "Amarelo", "Azul", "Vermelho", "Cinza", "Lilás", "Laranja", "Azul-claro"],
-        "Significado": [
-            "Linha incluída pela rotina (I, ou J + I de lastro sem evento)",
-            f"J com percentual alterado para {MINIMO_TXT} (a data também pode ter ido para o dia útil — ver log)",
-            "Evento com data levada para o dia útil (data cadastrada em data_evento_original)",
-            "Linha que será excluída (L ou B) — só aparece no arquivo ANTES. "
-            "Na aba Validações: lastro com divergência na soma de I",
-            "Lastro em pendência: fica fora do arquivo final (ver abas Pendências e Fluxo Pendências) "
-            "— só aparece no arquivo ANTES",
-            "Lastro fora da análise: tipo de ativo fora do filtro ou compromissada (ver aba Fora da Análise) "
-            "— só aparece no arquivo ANTES",
-            "Lastro vencendo no intervalo: sem atuação (ver aba Lastros Vencendo) — só aparece no arquivo ANTES",
-            "Título público (posição U): fora do tratamento (ver aba Títulos Públicos) "
-            "— só aparece no arquivo ANTES",
-        ],
-    })
+    legenda = pd.DataFrame([
+        ("Verde", "Linha incluída pela rotina (I, ou J + I de lastro sem evento)"),
+        ("Amarelo", f"J com percentual alterado para {MINIMO_TXT} "
+                    "(a data também pode ter ido para o dia útil — ver log)"),
+        ("Azul", "Fluxo Tratado: data levada para o dia útil (data cadastrada em data_evento_original). "
+                 "Fluxo Sem Alteração: data em fim de semana/feriado, mantida (dia útil em "
+                 "data_evento_ajustada, só para consulta)"),
+        ("Vermelho", "ANTES: linha que será excluída (L ou B). Aba Validações: divergência na soma de I"),
+        ("Cinza", "ANTES: lastro em pendência (abas Pendências e Fluxo Pendências)"),
+        ("Rosa", "ANTES: compromissada (aba Compromissadas)"),
+        ("Lilás", "ANTES: tipo de ativo não configurado (aba Fora da Análise)"),
+        ("Laranja", "ANTES: vencendo no intervalo, sem atuação (aba Lastros Vencendo)"),
+        ("Azul-claro", "ANTES: título público (aba Títulos Públicos)"),
+    ], columns=["Cor", "Significado"])
+    resumo = pd.DataFrame(resumo_em_linhas(resultado, info_execucao), columns=["Seção", "Item", "Valor"])
 
     pasta = Path(pasta_saida)
     pasta.mkdir(parents=True, exist_ok=True)
@@ -166,16 +188,19 @@ def gerar_excels(
     with pd.ExcelWriter(caminho_depois, engine="openpyxl") as excel:
         _escrever_aba(excel, resultado.fluxo_tratado, "Fluxo Tratado",
                       [cores.get(m) for m in resultado.marcas_depois])
+        _escrever_aba(excel, resultado.fluxo_sem_alteracao, "Fluxo Sem Alteração",
+                      [cores.get(m) for m in resultado.marcas_sem_alteracao])
         _escrever_validacoes(excel, resultado.validacao_consolidada, resultado.validacao_lastros,
                              cores[tf.MARCA_INCLUIDA], cores[tf.MARCA_EXCLUIDA])
         _escrever_aba(excel, resultado.pendencias, "Pendências")
         _escrever_aba(excel, resultado.fluxo_pendencias, "Fluxo Pendências")
         _escrever_aba(excel, resultado.fluxo_vencendo, "Lastros Vencendo")
+        _escrever_aba(excel, resultado.fluxo_compromissadas, "Compromissadas")
         _escrever_aba(excel, resultado.fluxo_fora_analise, "Fora da Análise")
         _escrever_aba(excel, resultado.fluxo_titulos_publicos, "Títulos Públicos")
         _escrever_aba(excel, resultado.log_alteracoes, "Log de Alterações")
         _escrever_aba(excel, resultado.diagnostico, "Diagnóstico")
-        _escrever_aba(excel, pd.DataFrame(list(resultado.resumo.items()), columns=["Item", "Valor"]), "Resumo")
+        _escrever_aba(excel, resumo, "Resumo")
         _escrever_aba(excel, legenda, "Legenda")
 
     return caminho_antes.resolve(), caminho_depois.resolve(), resultado
