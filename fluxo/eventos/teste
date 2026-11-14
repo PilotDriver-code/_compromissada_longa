@@ -1,0 +1,51 @@
+1. Função nova
+Cole logo acima da linha def _eh_linha_vazia(df: pd.DataFrame) -> pd.Series::
+def _clearing_invalido(serie: pd.Series) -> pd.Series:
+    """
+    codigo_clearing sem cadastro válido: vazio, em branco ou zero
+    ("0", "00", "0.0", 0). Um código que só COMEÇA com zero não entra aqui.
+    """
+    texto = serie.astype("string").str.strip()
+    zero = texto.str.fullmatch(r"0+(\.0+)?").fillna(False).astype(bool)
+    return (texto.isna() | texto.eq("").fillna(False) | zero).astype(bool)
+2. Dentro de _separar_lastros
+Antes:
+    cadastro = (trabalho[trabalho[COL_ATIVO].notna() & ~trabalho[COL_LASTRO].isin(publicos)]
+Depois:
+    cadastro = (trabalho[~_clearing_invalido(trabalho[COL_ATIVO]) & ~trabalho[COL_LASTRO].isin(publicos)]
+3. Dentro de processar_eventos, onde identifica os lastros sem cadastro
+Antes:
+    sem_ativo = trabalho[COL_ATIVO].isna()
+Depois:
+    sem_ativo = _clearing_invalido(trabalho[COL_ATIVO])   # vazio ou zero (R8)
+4. Bloco R8, no começo
+Antes:
+    # --- R8: lastros sem codigo_clearing -> pendência, sem alteração --------
+    for lastro, _ in trabalho[sem_ativo].groupby(COL_LASTRO, sort=False):
+        ev = no_intervalo[no_intervalo[COL_LASTRO] == lastro]
+        diagnostico.append({
+            COL_ATIVO: None, COL_LASTRO: lastro, COL_LOG_DIA_UTIL: None,
+Depois:
+    # --- R8: lastros sem codigo_clearing (vazio ou zero) -> pendência -----
+    for lastro, linhas in trabalho[sem_ativo].groupby(COL_LASTRO, sort=False):
+        ev = no_intervalo[no_intervalo[COL_LASTRO] == lastro]
+        clearing = linhas[COL_ATIVO].iloc[0]
+        motivo = ("Lastro sem codigo_clearing (sem cadastro)" if pd.isna(clearing) or str(clearing).strip() == ""
+                  else f"Lastro com codigo_clearing = {str(clearing).strip()} (sem cadastro válido)")
+        diagnostico.append({
+            COL_ATIVO: clearing, COL_LASTRO: lastro, COL_LOG_DIA_UTIL: None,
+5. Bloco R8, no fim (poucas linhas abaixo da mudança 4)
+Antes:
+            "Observação": "Lastro sem codigo_clearing (sem cadastro)",
+Depois:
+            "Observação": motivo,
+6. Logo depois do bloco R8
+Antes:
+    grupos_validos = no_intervalo[no_intervalo[COL_ATIVO].notna()]
+Depois:
+    grupos_validos = no_intervalo[~_clearing_invalido(no_intervalo[COL_ATIVO])]
+Opcional: a descrição no topo do arquivo
+Antes:
+R8. Lastro sem codigo_clearing (sem cadastro).
+Depois:
+R8. Lastro sem codigo_clearing (sem cadastro) ou com codigo_clearing = 0.
