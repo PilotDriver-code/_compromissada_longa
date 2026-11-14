@@ -23,7 +23,7 @@ import pyodbc                                   # noqa: E402
 from bizdays import Calendar                    # noqa: E402
 
 from aws.query_eventos import QUERY_EVENTOS     # noqa: E402
-from eventos.exportacao import gerar_excels     # noqa: E402
+from eventos.exportacao import formatar_resumo_terminal, gerar_excels   # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -122,23 +122,32 @@ def obter_dados_athena(data_inicial, data_final) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Rotina
 # ---------------------------------------------------------------------------
-def rodar(data_inicial: str, data_final: str) -> None:
+def rodar(data_inicial: str, data_final: str):
+    """Executa a rotina completa e devolve o resultado (útil para a futura tela)."""
     tipos_ativo = carregar_tipos_ativo()
-    print(f"Tipos de ativo na análise: {', '.join(tipos_ativo)}")
+    ini, fim = pd.Timestamp(data_inicial).normalize(), pd.Timestamp(data_final).normalize()
+    posicao_de, posicao_ate = calcular_janela_posicao(ini)
+    info_execucao = {
+        "Fluxo - data inicial": f"{ini:%d/%m/%Y}",
+        "Fluxo - data final": f"{fim:%d/%m/%Y}",
+        "Posição - data inicial": f"{posicao_de:%d/%m/%Y}",
+        "Posição - data final": f"{posicao_ate:%d/%m/%Y}",
+        "Tipos de ativo considerados": ", ".join(tipos_ativo),
+    }
 
+    print("Executando a query no Athena...")
     df = obter_dados_athena(data_inicial, data_final)
-    print(f"Linhas recebidas da query: {len(df)}")
 
     caminho_antes, caminho_depois, resultado = gerar_excels(
         df, data_inicial, data_final, PASTA_SAIDA,
-        levar_para_dia_util=LEVAR_PARA_DIA_UTIL, tipos_ativo=tipos_ativo,
+        levar_para_dia_util=LEVAR_PARA_DIA_UTIL, tipos_ativo=tipos_ativo, info_execucao=info_execucao,
     )
 
-    print("\n=== RESUMO ===")
-    for item, valor in resultado.resumo.items():
-        print(f"{item}: {valor}")
+    print()
+    print(formatar_resumo_terminal(resultado, info_execucao))
     print(f"\nExcel ANTES : {caminho_antes}")
     print(f"Excel DEPOIS: {caminho_depois}")
+    return resultado
 
 
 if __name__ == "__main__":
