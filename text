@@ -1,139 +1,143 @@
--- ============================================================================= CONSULTA PARA SABER SE TEM MAIS DE LASTRO PARA UM MESMO ATIVO
-SELECT
-    codigo_clearing,
-    COUNT(DISTINCT codigo_lastro) AS qtd_lastros,
-    array_agg(codigo_lastro)      AS lastros
-FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa
-WHERE sigla_sistema_origem = 'LZ'
-GROUP BY codigo_clearing
-HAVING COUNT(DISTINCT codigo_lastro) > 1
-LIMIT 20
+"""
+Exemplo com dados fictícios no mesmo formato do resultado da query.
+
+Intervalo analisado: 07/11/2026 (sáb) a 10/11/2026 (ter)
+  -> dia útil 09/11: eventos de 07, 08 e 09/11 (analisados juntos)
+  -> dia útil 10/11: eventos de 10/11
+
+Gera os Excel ANTES e DEPOIS na pasta "saida_exemplo" (raiz do projeto).
+Para os dados reais, use eventos/rodar.py.
+
+Como rodar (a partir da pasta raiz do projeto):
+    python -m eventos.exemplo
+ou pelo botão "Run" do VS Code com este arquivo aberto.
+"""
+
+import sys
+from pathlib import Path
+
+RAIZ_PROJETO = Path(__file__).resolve().parent.parent
+if str(RAIZ_PROJETO) not in sys.path:          # permite rodar o arquivo direto
+    sys.path.insert(0, str(RAIZ_PROJETO))
+
+import pandas as pd                                 # noqa: E402
+
+from eventos import tratamento_fluxo as tf          # noqa: E402
+from eventos.exportacao import gerar_excels         # noqa: E402
+
+pd.set_option("display.width", 250)
+pd.set_option("display.max_columns", 20)
+pd.set_option("display.max_colwidth", 70)
+pd.set_option("display.float_format", lambda v: f"{v:.10f}".rstrip("0").rstrip("."))
+
+DATA_INICIAL = "2026-11-07"
+DATA_FINAL = "2026-11-10"
+TIPOS_EXEMPLO = ["CRI"]          # tipos que entram na análise (no real: config/filtros.json)
+
+COLUNAS = [
+    "codigo_lastro", "data_evento", "sigla_evento", "percentual_juros_evento",
+    "sigla_sistema_origem", "tipo_ativo", "data_vencimento", "codigo_clearing", "origem_selecao",
+]
+BASE, IRMAO = "EVENTO_NO_INTERVALO", "IRMAO_SEM_EVENTO"
 
 
+def montar_exemplo() -> pd.DataFrame:
+    def ev(lastro, data, sigla, perc, clearing, origem=BASE, tipo="CRI", venc="2030-12-31"):
+        return (lastro, data, sigla, perc, "LZ", tipo, venc, clearing, origem)
 
--- ============================================================================= CONSULTA PARA SABER SE TEM MAIS DE UM CD_LASTRO
-SELECT codigo_lastro, sigla_sistema_origem, COUNT(*) AS qtd
-FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa
-WHERE sigla_sistema_origem = 'LZ'
-GROUP BY codigo_lastro, sigla_sistema_origem
-HAVING COUNT(*) > 1
-LIMIT 20
+    def vazio(lastro, clearing, tipo="CRI", venc="2030-12-31"):
+        return (lastro, None, None, None, "LZ", tipo, venc, clearing, IRMAO)
+
+    linhas = [
+        # ATIVO_A: L001 tem evento; L002 (vazio) e L003 (só linhas antigas) são irmãos
+        ev("L001", "2026-05-07", "J", 0.48, "ATIVO_A"),           # fora do intervalo
+        ev("L001", "2026-11-07", "J", 0.48, "ATIVO_A"),           # sáb -> dia útil 09/11 (Caso 1)
+        ev("L001", "2026-11-10", "J", 0.48, "ATIVO_A"),           # ter -> dia útil 10/11 (Caso 1)
+        ev("L001", "2030-12-31", "I", 100, "ATIVO_A"),            # vencimento
+        vazio("L002", "ATIVO_A"),                                  # irmão sem nenhum evento
+        ev("L003", "2025-03-10", "J", 0.50, "ATIVO_A", IRMAO),    # irmão com linhas antigas
+        ev("L003", "2025-03-10", "I", 100, "ATIVO_A", IRMAO),
+
+        # ATIVO_B: J no sábado + I na segunda -> mesmo dia útil -> já tem I (Caso 3)
+        ev("L004", "2026-11-07", "J", 0.30, "ATIVO_B"),
+        ev("L004", "2026-11-09", "I", 50, "ATIVO_B"),
+        ev("L004", "2030-12-31", "I", 49, "ATIVO_B"),            # origem soma 99 -> ERRO na validação
+
+        # ATIVO_C: J + L no domingo + B na segunda -> Caso 4
+        ev("L005", "2026-11-08", "J", 0.70, "ATIVO_C"),
+        ev("L005", "2026-11-08", "L", 100, "ATIVO_C"),
+        ev("L005", "2026-11-09", "B", 0, "ATIVO_C"),
+        ev("L005", "2030-12-31", "I", 100, "ATIVO_C"),
+
+        # ATIVO_D: J no sábado + J na segunda -> repetido no mesmo dia útil -> pendência
+        ev("L006", "2026-11-07", "J", 0.20, "ATIVO_D"),
+        ev("L006", "2026-11-09", "J", 0.25, "ATIVO_D"),
+
+        # ATIVO_E: L007 tem evento em 09/11, L008 em 10/11 -> cada um falta num dia útil
+        ev("L007", "2026-11-09", "J", 0.40, "ATIVO_E"),
+        ev("L007", "2026-11-09", "M", 0, "ATIVO_E"),              # Caso 2
+        ev("L008", "2026-11-10", "J", 0.40, "ATIVO_E"),           # Caso 1
+        ev("L007", "2030-12-31", "I", 100, "ATIVO_E"),
+        ev("L008", "2030-12-31", "I", 100, "ATIVO_E"),
+
+        # ATIVO_F: J + B (sem L) -> exclui B, J = mínimo, inclui I
+        ev("L009", "2026-11-10", "J", 0.90, "ATIVO_F"),
+        ev("L009", "2026-11-10", "B", 0, "ATIVO_F"),
+        ev("L009", "2030-12-31", "I", 100, "ATIVO_F"),
+
+        # ATIVO_G: código desconhecido em 09/11 -> pendência; o J normal de 10/11
+        # não salva o lastro: ele sai INTEIRO do fluxo final
+        ev("L010", "2026-11-09", "J", 1.0, "ATIVO_G"),
+        ev("L010", "2026-11-09", "X", 5, "ATIVO_G"),
+        ev("L010", "2026-11-10", "J", 1.0, "ATIVO_G"),
+
+        # ATIVO_H: irmão com evento só M (sem J) -> par J+I usa a data do M
+        ev("L011", "2026-11-08", "M", 0, "ATIVO_H"),
+        ev("L011", "2030-12-31", "I", 100, "ATIVO_H"),
+        vazio("L012", "ATIVO_H"),
+
+        # Lastro sem cadastro (codigo_clearing vazio) -> pendência
+        ev("L013", "2026-11-09", "J", 0.60, None, tipo=None, venc=None),
+
+        # ---- Fora da análise / vencendo (sem nenhuma alteração) ----
+        ev("L014", "2026-11-09", "J", 0.30, "ATIVO_I", tipo="DEB"),     # tipo fora do filtro
+        ev("L014", "2030-12-31", "I", 100, "ATIVO_I", tipo="DEB"),
+        ev("L015", "2026-11-10", "J", 0.30, "ATIVO_J"),                 # compromissada = S
+        ev("L015", "2030-12-31", "I", 100, "ATIVO_J"),
+        ev("L016", "2026-11-09", "J", 0.30, "ATIVO_K", venc="2026-11-09"),  # vence no intervalo
+        ev("L016", "2026-11-09", "I", 100, "ATIVO_K", venc="2026-11-09"),
+        vazio("L017", "ATIVO_A", tipo="DEB"),                           # irmão do ATIVO_A, tipo fora
+        ev("L018", "2026-11-09", "J", 2.5, "NTNB_2035", tipo="NTNB"),   # título público (posição U)
+        ev("L018", "2035-05-15", "I", 100, "NTNB_2035", tipo="NTNB"),
+        # Já vem certo, em dia útil (I + J em 10/11) -> Fluxo Sem Alteração
+        ev("L020", "2026-11-10", "J", 0.50, "ATIVO_M"),
+        ev("L020", "2026-11-10", "I", 50, "ATIVO_M"),
+        ev("L020", "2030-12-31", "I", 50, "ATIVO_M"),
+    ]
+    df = pd.DataFrame(linhas, columns=COLUNAS)
+    # indicador_compromissada vem do cadastro do lastro (mesma posição da query)
+    df.insert(df.columns.get_loc("origem_selecao"), "indicador_compromissada",
+              ["S" if l == "L015" else "N" for l in df["codigo_lastro"]])
+    # titulo_publico vem da posição (indicador_publico_privado = 'U')
+    df.insert(df.columns.get_loc("origem_selecao"), "titulo_publico",
+              ["S" if l == "L018" else "N" for l in df["codigo_lastro"]])
+    return df
 
 
+if __name__ == "__main__":
+    antes, depois, res = gerar_excels(montar_exemplo(), DATA_INICIAL, DATA_FINAL,
+                                      RAIZ_PROJETO / "saida_exemplo", tipos_ativo=TIPOS_EXEMPLO)
+    print(f"Excel ANTES:  {antes}")
+    print(f"Excel DEPOIS: {depois}\n")
 
--- =============================================================================
--- Fluxo completo dos lastros a tratar — AWS Athena
---
--- Exemplo preenchido para:
---   Intervalo de eventos : 07/11/2026 a 09/11/2026
---   Janela de posição    : 28/10/2026 a 06/11/2026  (D-7 a D-1 úteis ANBIMA da data inicial)
---
--- Na rotina Python, as 4 datas marcadas com [PARAM] são calculadas
--- automaticamente (incluindo o calendário ANBIMA). Aqui estão fixas só
--- para você conseguir rodar e conferir no Athena.
---
--- A query NÃO decide nada sobre regras: só traz os dados. O agrupamento por
--- dia útil, a detecção de "lastro sem fluxo" e as regras de I/J/L/B/M ficam
--- no Python.
--- =============================================================================
-
-WITH
--- 1) Lastros com pelo menos um evento no intervalo informado
-lastros_com_evento AS (
-    SELECT DISTINCT
-        ev.codigo_lastro,
-        ev.sigla_sistema_origem
-    FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_evento_renda_fixa ev
-    WHERE ev.sigla_sistema_origem = 'LZ'
-      AND ev.data_evento >= TIMESTAMP '2026-11-07 00:00:00'   -- [PARAM] data inicial
-      AND ev.data_evento <  TIMESTAMP '2026-11-10 00:00:00'   -- [PARAM] data final + 1 dia
-),
-
--- 2) Lastros com posição na janela D-7 a D-1
-lastros_com_posicao AS (
-    SELECT DISTINCT
-        posicao.codigo_ativo_lastro AS codigo_lastro,
-        posicao.sigla_sistema_origem
-    FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_posicao_fundo_renda_fixa posicao
-    WHERE posicao.sigla_sistema_origem = 'LZ'
-      AND posicao.data_posicao >= TIMESTAMP '2026-10-28 00:00:00'   -- [PARAM] D-7 útil
-      AND posicao.data_posicao <  TIMESTAMP '2026-11-07 00:00:00'   -- [PARAM] D-1 útil + 1 dia
-),
-
--- 3) Lastros base: têm evento no intervalo E têm posição
-lastros_base AS (
-    SELECT e.codigo_lastro, e.sigla_sistema_origem
-    FROM lastros_com_evento e
-    INNER JOIN lastros_com_posicao p
-            ON p.codigo_lastro        = e.codigo_lastro
-           AND p.sigla_sistema_origem = e.sigla_sistema_origem
-),
-
--- 4) Ativos (codigo_clearing) desses lastros, via cadastro
-ativos_base AS (
-    SELECT DISTINCT
-        cad.codigo_clearing,
-        cad.sigla_sistema_origem
-    FROM lastros_base b
-    INNER JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad
-            ON cad.codigo_lastro        = b.codigo_lastro
-           AND cad.sigla_sistema_origem = b.sigla_sistema_origem
-    WHERE cad.codigo_clearing IS NOT NULL
-),
-
--- 5) Lastros "irmãos": mesmo codigo_clearing, com posição, que ainda não
---    estão nos lastros base (podem não ter nenhum evento cadastrado)
-lastros_irmaos AS (
-    SELECT DISTINCT
-        cad.codigo_lastro,
-        cad.sigla_sistema_origem
-    FROM db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad
-    INNER JOIN ativos_base a
-            ON a.codigo_clearing      = cad.codigo_clearing
-           AND a.sigla_sistema_origem = cad.sigla_sistema_origem
-    INNER JOIN lastros_com_posicao p
-            ON p.codigo_lastro        = cad.codigo_lastro
-           AND p.sigla_sistema_origem = cad.sigla_sistema_origem
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM lastros_base b
-        WHERE b.codigo_lastro        = cad.codigo_lastro
-          AND b.sigla_sistema_origem = cad.sigla_sistema_origem
-    )
-),
-
--- 6) Todos os lastros que entram na análise
-lastros_selecionados AS (
-    SELECT codigo_lastro, sigla_sistema_origem, 'EVENTO_NO_INTERVALO' AS origem_selecao
-    FROM lastros_base
-    UNION ALL
-    SELECT codigo_lastro, sigla_sistema_origem, 'IRMAO_SEM_EVENTO' AS origem_selecao
-    FROM lastros_irmaos
-)
-
--- 7) Fluxo COMPLETO (todas as datas) de cada lastro selecionado.
---    LEFT JOIN nos eventos: um lastro irmão sem nenhum evento aparece em
---    uma linha com data_evento / sigla_evento / percentual vazios, só para
---    trazer os dados de cadastro usados na criação do J + I.
-SELECT
-    sel.codigo_lastro,
-    ev.data_evento,
-    ev.sigla_evento,
-    ev.percentual_juros_evento,
-    sel.sigla_sistema_origem,
-    cad_lastro.tipo_ativo,
-    cad_lastro.data_vencimento,
-    cad_lastro.codigo_clearing,
-    sel.origem_selecao
-FROM lastros_selecionados sel
-LEFT JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_evento_renda_fixa ev
-       ON ev.codigo_lastro        = sel.codigo_lastro
-      AND ev.sigla_sistema_origem = sel.sigla_sistema_origem
-LEFT JOIN db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01.tbih3_cadastro_ativo_lastro_renda_fixa cad_lastro
-       ON cad_lastro.codigo_lastro        = sel.codigo_lastro
-      AND cad_lastro.sigla_sistema_origem = sel.sigla_sistema_origem
-ORDER BY
-    cad_lastro.codigo_clearing,
-    sel.codigo_lastro,
-    ev.data_evento,
-    ev.sigla_evento
+    print("=== FLUXO TRATADO (final) ===")
+    print(res.fluxo_tratado.to_string(index=False))
+    print("\n=== LOG DE ALTERAÇÕES ===")
+    print(res.log_alteracoes.to_string(index=False))
+    print("\n=== DIAGNÓSTICO ===")
+    print(res.diagnostico.to_string(index=False))
+    print("\n=== PENDÊNCIAS ===")
+    print(res.pendencias.to_string(index=False))
+    print("\n=== RESUMO ===")
+    for k, v in res.resumo.items():
+        print(f"{k}: {v}")
