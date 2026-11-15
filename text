@@ -1,110 +1,206 @@
-from datetime import date
+"""
+Rotina principal: monta e executa a query no Athena, trata o resultado e
+gera os Excel ANTES e DEPOIS e os TXT de upload.
 
-import config
+Na Central, quem chama esta rotina é a tela Eventos SAC (via tasks/eventos_sac/eventos_sac.py),
+passando as datas, as bases e as pastas. A janela de posição
+(D-7 a D-1 úteis ANBIMA da data inicial) é calculada automaticamente.
+
+Para rodar sem a tela (a partir da pasta da Central, onde está o main.py):
+    python -m tasks.eventos_sac.eventos.rodar
+"""
+
+import json
+import re
+from pathlib import Path
+
+import pandas as pd
+from bizdays import Calendar
+
 from core import configuracoes as cfg
+from ..aws.query_eventos import QUERY_EVENTOS
+from .exportacao import (formatar_alerta_divergencias, formatar_resumo_terminal,
+                         gerar_arquivos_upload, gerar_excels)
 
-from ..qt import QtCore, QtWidgets
-from ..widgets import ChipGroup, Field, hline, label, repolish
-from .base import BasePage
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
+# Usados só quando o arquivo é rodado direto (sem a tela)
+DATA_INICIAL = "2026-11-10"
+DATA_FINAL = "2026-11-10"
+BASES = ["LZ"]
 
-W = QtWidgets
+DSN_ATHENA = "AWS Athena ODBC"
+DIAS_UTEIS_POSICAO = 7   # janela de posição: D-7 até D-1
+
+# True  = eventos do intervalo em fim de semana/feriado vão para o próximo dia útil
+#         (data cadastrada fica na coluna data_evento_original)
+# False = mantém as datas cadastradas
+LEVAR_PARA_DIA_UTIL = True
 
 
-def _qdate(d: date) -> QtCore.QDate:
-    return QtCore.QDate(d.year, d.month, d.day)
+# ---------------------------------------------------------------------------
+# Configuração de filtros
+# ---------------------------------------------------------------------------
+def carregar_tipos_ativo(caminho: Path | None = None) -> list[str]:
+    """Lê a lista de tipos de ativo que entram na análise (setup/Config/filtros.json)."""
+    caminho = Path(caminho or cfg.arquivo_filtros_eventos())
+    if not caminho.exists():
+        raise FileNotFoundError(f"Arquivo de configuração não encontrado: {caminho}")
+    config = json.loads(caminho.read_text(encoding="utf-8"))
+    tipos = [str(t).strip() for t in config.get("tipos_ativo", []) if str(t).strip()]
+    if not tipos:
+        raise ValueError(f"Nenhum tipo de ativo configurado em 'tipos_ativo' ({caminho}).")
+    return tipos
 
 
-def _pydate(q: QtCore.QDate) -> date:
-    return date(q.year(), q.month(), q.day())
+# ---------------------------------------------------------------------------
+# Datas e bases da query
+# ---------------------------------------------------------------------------
+def calcular_janela_posicao(data_inicial) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    D-7 a D-1 dias úteis ANBIMA da data inicial.
+    Se a data inicial não for dia útil (ex.: sábado), o D-1 é o último dia útil antes dela.
+    """
+    cal = Calendar.load(name="ANBIMA")
+    dia_anterior = (pd.Timestamp(data_inicial).normalize() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    d_menos_1 = pd.Timestamp(cal.preceding(dia_anterior))
+    d_menos_7 = pd.Timestamp(cal.offset(d_menos_1.strftime("%Y-%m-%d"), -(DIAS_UTEIS_POSICAO - 1)))
+    return d_menos_7, d_menos_1
 
 
-class EventosSACPage(BasePage):
-    title = "Eventos SAC"
-    description = "Trate os eventos do período e gere os Excel e os arquivos de upload."
-    nav_icon = "calendar"
-    nav_label = "Eventos SAC"
+def bases_para_sql(bases: list[str]) -> str:
+    """['LZ', 'XZ'] -> "'LZ', 'XZ'". Só aceita letras e números (protege a query)."""
+    limpas = [str(b).strip().upper() for b in bases if str(b).strip()]
+    if not limpas:
+        raise ValueError("Nenhuma base informada.")
+    invalidas = [b for b in limpas if not re.fullmatch(r"[A-Z0-9_]+", b)]
+    if invalidas:
+        raise ValueError(f"Base(s) inválida(s): {', '.join(invalidas)}")
+    return ", ".join(f"'{b}'" for b in limpas)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        form = self.build_split("Parâmetros", "Processar")
 
-        # Período ------------------------------------------------------------
-        hoje = date.today()
-        self.dt_ini = self._date_edit(hoje)
-        self.dt_fim = self._date_edit(hoje)
-        row = W.QHBoxLayout()
-        row.setSpacing(12)
-        row.addWidget(Field("Data início", self.dt_ini), 1)
-        row.addWidget(Field("Data final", self.dt_fim), 1)
-        form.addLayout(row)
+def montar_query(data_inicial, data_final, bases: list[str]) -> str:
+    """Preenche a query com as bases, as datas do evento e a janela de posição."""
+    ini = pd.Timestamp(data_inicial).normalize()
+    fim = pd.Timestamp(data_final).normalize()
+    if ini > fim:
+        raise ValueError(f"Data inicial ({ini:%d/%m/%Y}) maior que a data final ({fim:%d/%m/%Y}).")
 
-        self.f_range = label("", "Hint", wrap=True)
-        form.addWidget(self.f_range)
+    posicao_de, posicao_ate = calcular_janela_posicao(ini)
+    print(f"Eventos: {ini:%d/%m/%Y} a {fim:%d/%m/%Y} | "
+          f"Posição: {posicao_de:%d/%m/%Y} a {posicao_ate:%d/%m/%Y}")
 
-        # Bases (no lugar dos antigos atalhos) --------------------------------
-        self.bases = ChipGroup(config.BASES_EVENTOS_SAC)
-        self.f_bases = Field("Bases", self.bases)
-        self.bases.changed.connect(lambda sel: self.f_bases.set_hint(""))
-        form.addWidget(self.f_bases)
+    um_dia = pd.Timedelta(days=1)
+    return QUERY_EVENTOS.format(
+        bases=bases_para_sql(bases),
+        evento_de=f"{ini:%Y-%m-%d}",
+        evento_ate_exclusivo=f"{fim + um_dia:%Y-%m-%d}",
+        posicao_de=f"{posicao_de:%Y-%m-%d}",
+        posicao_ate_exclusivo=f"{posicao_ate + um_dia:%Y-%m-%d}",
+    )
 
-        form.addWidget(hline())
 
-        # Onde os arquivos vão parar -----------------------------------------
-        form.addWidget(self.fixed_path_field("Saída (Excel ANTES e DEPOIS)",
-                                             lambda: cfg.pasta("eventos_saida")))
-        form.addWidget(self.fixed_path_field("Upload (TXT, uma pasta por base)",
-                                             lambda: cfg.pasta("eventos_upload")))
+# ---------------------------------------------------------------------------
+# Athena
+# ---------------------------------------------------------------------------
+def executar_query_athena(query: str) -> pd.DataFrame | None:
+    """Executa a query via ODBC (DSN configurado na máquina) e devolve um DataFrame."""
+    import pyodbc  # aqui dentro: a Central abre mesmo sem o driver instalado
 
-        self.dt_ini.dateChanged.connect(self._validar_periodo)
-        self.dt_fim.dateChanged.connect(self._validar_periodo)
-        self._validar_periodo()
+    try:
+        connection = pyodbc.connect(f"DSN={DSN_ATHENA}", timeout=30)
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [column[0] for column in cursor.description]
+        results = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return pd.DataFrame.from_records(results, columns=columns)
+    except pyodbc.Error as e:
+        print("Erro ao conectar ou executar a query:", e)
+        return None
 
-    def _date_edit(self, d: date) -> W.QDateEdit:
-        e = W.QDateEdit()
-        e.setCalendarPopup(True)
-        e.setDisplayFormat("dd/MM/yyyy")
-        e.setMinimumDate(_qdate(config.DATA_MINIMA_EVENTOS))
-        e.setDate(_qdate(max(d, config.DATA_MINIMA_EVENTOS)))
-        return e
 
-    def _validar_periodo(self) -> bool:
-        """Data final >= data inicial. Mostra a quantidade de dias ou o erro abaixo das datas."""
-        ini, fim = _pydate(self.dt_ini.date()), _pydate(self.dt_fim.date())
-        ok = fim >= ini
-        self.dt_fim.setProperty("invalid", not ok)
-        repolish(self.dt_fim)
-        if ok:
-            dias = (fim - ini).days + 1
-            self.f_range.setText(f"{dias} dia" + ("s" if dias > 1 else "") + " no período")
-            self.f_range.setProperty("tone", "")
-        else:
-            self.f_range.setText("A data final precisa ser igual ou posterior à data de início.")
-            self.f_range.setProperty("tone", "error")
-        repolish(self.f_range)
-        return ok
+def obter_dados_athena(data_inicial, data_final, bases: list[str]) -> pd.DataFrame:
+    """Monta a query com as datas e bases, executa e devolve o DataFrame."""
+    df = executar_query_athena(montar_query(data_inicial, data_final, bases))
+    if df is None:
+        raise RuntimeError("A query no Athena falhou (ver mensagem de erro acima).")
+    return df
 
-    def run(self):
-        if not self.ensure_ready():
-            return
-        # Validações antes de executar: período e bases
-        if not self._validar_periodo():
-            self.toast("Ajuste o período antes de processar.", "error")
-            return
-        bases = self.bases.selected()
-        if not bases:
-            self.f_bases.set_hint("Selecione ao menos uma base.", "error")
-            self.toast("Selecione ao menos uma base para processar.", "error")
-            return
 
-        ini, fim = _pydate(self.dt_ini.date()), _pydate(self.dt_fim.date())
-        params = {
-            "inicio": f"{ini:%Y-%m-%d}",
-            "fim": f"{fim:%Y-%m-%d}",
-            "bases": bases,
-            "saida": str(cfg.pasta("eventos_saida")),
-            "upload": str(cfg.pasta("eventos_upload")),
-            "filtros": str(cfg.arquivo_filtros_eventos()),
-        }
-        from tasks.eventos_sac import eventos_sac  # só carrega quando clicar em Processar
-        titulo = f"Eventos SAC: {ini:%d/%m/%Y} a {fim:%d/%m/%Y} ({', '.join(bases)})"
-        self.start_task(eventos_sac.executar, params, titulo)
+# ---------------------------------------------------------------------------
+# Rotina
+# ---------------------------------------------------------------------------
+def _avancar(ctx, pct: int) -> None:
+    """Atualiza a barra da tela e respeita o botão Cancelar (sem tela, não faz nada)."""
+    if ctx is not None:
+        ctx.check()
+        ctx.progress(pct)
+
+
+def rodar(data_inicial, data_final, bases: list[str],
+          pasta_saida: Path | None = None, pasta_upload: Path | None = None,
+          arquivo_filtros: Path | None = None, ctx=None) -> dict:
+    """
+    Executa a rotina completa.
+    Devolve {"resultado", "excel_antes", "excel_depois", "uploads", "alerta"}.
+    """
+    pasta_saida = Path(pasta_saida or cfg.pasta("eventos_saida"))
+    pasta_upload = Path(pasta_upload or cfg.pasta("eventos_upload"))
+
+    _avancar(ctx, 5)
+    tipos_ativo = carregar_tipos_ativo(arquivo_filtros)
+    ini, fim = pd.Timestamp(data_inicial).normalize(), pd.Timestamp(data_final).normalize()
+    posicao_de, posicao_ate = calcular_janela_posicao(ini)
+    info_execucao = {
+        "Bases": ", ".join(bases),
+        "Fluxo - data inicial": f"{ini:%d/%m/%Y}",
+        "Fluxo - data final": f"{fim:%d/%m/%Y}",
+        "Posição - data inicial": f"{posicao_de:%d/%m/%Y}",
+        "Posição - data final": f"{posicao_ate:%d/%m/%Y}",
+        "Tipos de ativo considerados": ", ".join(tipos_ativo),
+    }
+
+    _avancar(ctx, 10)
+    print("Executando a query no Athena...")
+    df = obter_dados_athena(data_inicial, data_final, bases)
+    print(f"Query retornou {len(df)} linha(s).")
+
+    _avancar(ctx, 60)
+    print("Tratando o fluxo e gerando os Excel...")
+    caminho_antes, caminho_depois, resultado = gerar_excels(
+        df, data_inicial, data_final, pasta_saida,
+        levar_para_dia_util=LEVAR_PARA_DIA_UTIL, tipos_ativo=tipos_ativo, info_execucao=info_execucao,
+    )
+
+    _avancar(ctx, 85)
+    arquivos_upload = gerar_arquivos_upload(resultado, data_inicial, data_final, pasta_upload)
+
+    _avancar(ctx, 95)
+    print()
+    print(formatar_resumo_terminal(resultado, info_execucao))
+    print(f"\nExcel ANTES : {caminho_antes}")
+    print(f"Excel DEPOIS: {caminho_depois}")
+    if arquivos_upload:
+        for caminho in arquivos_upload:
+            print(f"TXT upload  : {caminho}")
+    else:
+        print("TXT upload  : não gerado (nenhum lastro no Fluxo Tratado)")
+
+    alerta = formatar_alerta_divergencias(resultado)
+    if alerta:
+        print(alerta)
+    _avancar(ctx, 100)
+    return {
+        "resultado": resultado,
+        "excel_antes": caminho_antes,
+        "excel_depois": caminho_depois,
+        "uploads": arquivos_upload,
+        "alerta": alerta,
+    }
+
+
+if __name__ == "__main__":
+    rodar(DATA_INICIAL, DATA_FINAL, BASES)
