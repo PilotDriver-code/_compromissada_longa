@@ -1,59 +1,110 @@
-"""Ligação da tela Eventos SAC com a rotina (eventos/rodar.py)."""
+from datetime import date
 
-import contextlib
-import io
-from pathlib import Path
+import config
+from core import configuracoes as cfg
 
-from .eventos import rodar
+from ..qt import QtCore, QtWidgets
+from ..widgets import ChipGroup, Field, hline, label, repolish
+from .base import BasePage
 
-
-class _ParaConsole(io.TextIOBase):
-    """Manda cada print() da rotina para o console da tela, com cor conforme o conteúdo."""
-
-    def __init__(self, ctx):
-        self.ctx, self._buf = ctx, ""
-
-    def write(self, texto):
-        self._buf += texto
-        while "\n" in self._buf:
-            linha, self._buf = self._buf.split("\n", 1)
-            if not linha.strip():
-                continue
-            if linha.lower().startswith("erro"):
-                nivel = "error"
-            elif "ATENÇÃO" in linha or linha.startswith("!!!"):
-                nivel = "warn"
-            else:
-                nivel = "info"
-            self.ctx.log(linha, nivel)
-        return len(texto)
+W = QtWidgets
 
 
-def executar(params: dict, ctx) -> str:
-    """Chamado pela tela Eventos SAC quando o usuário clica em Processar."""
-    bases = params["bases"]
-    # Uma subpasta por combinação de bases: rodar LZ e depois XZ na mesma data não sobrescreve o Excel
-    pasta_saida = Path(params["saida"]) / "_".join(bases)
+def _qdate(d: date) -> QtCore.QDate:
+    return QtCore.QDate(d.year, d.month, d.day)
 
-    with contextlib.redirect_stdout(_ParaConsole(ctx)):
-        try:
-            saida = rodar.rodar(
-                params["inicio"], params["fim"], bases,
-                pasta_saida=pasta_saida,
-                pasta_upload=params["upload"],
-                arquivo_filtros=params["filtros"],
-                ctx=ctx,
-            )
-        except PermissionError as exc:
-            raise RuntimeError(
-                f"Não foi possível gravar {exc.filename}. "
-                "Se o arquivo estiver aberto no Excel, feche e rode de novo."
-            ) from exc
 
-    if saida["alerta"]:
-        ctx.log("Há divergência na soma das amortizações (I): veja o Excel DEPOIS.", "warn")
+def _pydate(q: QtCore.QDate) -> date:
+    return date(q.year(), q.month(), q.day())
 
-    uploads = saida["uploads"]
-    if uploads:
-        return f"Eventos SAC concluído: {len(uploads)} arquivo(s) de upload gerado(s)."
-    return "Eventos SAC concluído: nenhum TXT de upload (nenhum lastro no Fluxo Tratado)."
+
+class EventosSACPage(BasePage):
+    title = "Eventos SAC"
+    description = "Trate os eventos do período e gere os Excel e os arquivos de upload."
+    nav_icon = "calendar"
+    nav_label = "Eventos SAC"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        form = self.build_split("Parâmetros", "Processar")
+
+        # Período ------------------------------------------------------------
+        hoje = date.today()
+        self.dt_ini = self._date_edit(hoje)
+        self.dt_fim = self._date_edit(hoje)
+        row = W.QHBoxLayout()
+        row.setSpacing(12)
+        row.addWidget(Field("Data início", self.dt_ini), 1)
+        row.addWidget(Field("Data final", self.dt_fim), 1)
+        form.addLayout(row)
+
+        self.f_range = label("", "Hint", wrap=True)
+        form.addWidget(self.f_range)
+
+        # Bases (no lugar dos antigos atalhos) --------------------------------
+        self.bases = ChipGroup(config.BASES_EVENTOS_SAC)
+        self.f_bases = Field("Bases", self.bases)
+        self.bases.changed.connect(lambda sel: self.f_bases.set_hint(""))
+        form.addWidget(self.f_bases)
+
+        form.addWidget(hline())
+
+        # Onde os arquivos vão parar -----------------------------------------
+        form.addWidget(self.fixed_path_field("Saída (Excel ANTES e DEPOIS)",
+                                             lambda: cfg.pasta("eventos_saida")))
+        form.addWidget(self.fixed_path_field("Upload (TXT, uma pasta por base)",
+                                             lambda: cfg.pasta("eventos_upload")))
+
+        self.dt_ini.dateChanged.connect(self._validar_periodo)
+        self.dt_fim.dateChanged.connect(self._validar_periodo)
+        self._validar_periodo()
+
+    def _date_edit(self, d: date) -> W.QDateEdit:
+        e = W.QDateEdit()
+        e.setCalendarPopup(True)
+        e.setDisplayFormat("dd/MM/yyyy")
+        e.setMinimumDate(_qdate(config.DATA_MINIMA_EVENTOS))
+        e.setDate(_qdate(max(d, config.DATA_MINIMA_EVENTOS)))
+        return e
+
+    def _validar_periodo(self) -> bool:
+        """Data final >= data inicial. Mostra a quantidade de dias ou o erro abaixo das datas."""
+        ini, fim = _pydate(self.dt_ini.date()), _pydate(self.dt_fim.date())
+        ok = fim >= ini
+        self.dt_fim.setProperty("invalid", not ok)
+        repolish(self.dt_fim)
+        if ok:
+            dias = (fim - ini).days + 1
+            self.f_range.setText(f"{dias} dia" + ("s" if dias > 1 else "") + " no período")
+            self.f_range.setProperty("tone", "")
+        else:
+            self.f_range.setText("A data final precisa ser igual ou posterior à data de início.")
+            self.f_range.setProperty("tone", "error")
+        repolish(self.f_range)
+        return ok
+
+    def run(self):
+        if not self.ensure_ready():
+            return
+        # Validações antes de executar: período e bases
+        if not self._validar_periodo():
+            self.toast("Ajuste o período antes de processar.", "error")
+            return
+        bases = self.bases.selected()
+        if not bases:
+            self.f_bases.set_hint("Selecione ao menos uma base.", "error")
+            self.toast("Selecione ao menos uma base para processar.", "error")
+            return
+
+        ini, fim = _pydate(self.dt_ini.date()), _pydate(self.dt_fim.date())
+        params = {
+            "inicio": f"{ini:%Y-%m-%d}",
+            "fim": f"{fim:%Y-%m-%d}",
+            "bases": bases,
+            "saida": str(cfg.pasta("eventos_saida")),
+            "upload": str(cfg.pasta("eventos_upload")),
+            "filtros": str(cfg.arquivo_filtros_eventos()),
+        }
+        from tasks.eventos_sac import eventos_sac  # só carrega quando clicar em Processar
+        titulo = f"Eventos SAC: {ini:%d/%m/%Y} a {fim:%d/%m/%Y} ({', '.join(bases)})"
+        self.start_task(eventos_sac.executar, params, titulo)
