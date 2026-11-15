@@ -1,36 +1,31 @@
-    # Formatos especiais do console -------------------------------------------
-    def section(self, titulo: str) -> None:
-        """Título de seção no console (ex.: "Base LZ (1 de 2)")."""
-        self.log(titulo, "section")
+def validar_base(base: str) -> str:
+    """Normaliza a base (ex.: ' lz ' -> 'LZ'). Só aceita letras e números (protege a query)."""
+    limpa = str(base).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_]+", limpa):
+        raise ValueError(f"Base inválida: {base!r}")
+    return limpa
 
-    def file(self, caminho) -> None:
-        """Arquivo gerado: aparece como link (clique abre a pasta)."""
-        self.log(str(caminho), "file")
 
-    def table(self, titulo: str, linhas) -> None:
-        """Tabela chave/valor. `linhas` = [(chave, valor), ...]."""
-        import json
-
-        dados = {"titulo": titulo, "linhas": [[str(k), str(v)] for k, v in linhas]}
-        self.log(json.dumps(dados, ensure_ascii=False), "table")
+    # antes
+def montar_query(data_inicial, data_final, bases: list[str]) -> str:
+# depois
+def montar_query(data_inicial, data_final, base: str) -> str:
 
 
 
-
-
-
+# antes
+        bases=bases_para_sql(bases),
+# depois
+        base=validar_base(base),
 
 
 
 
 
 
-
-
-
-
-                except Falha as exc:
-            self.sig_done.emit("error", str(exc))
+        def obter_dados_athena(data_inicial, data_final, base: str) -> pd.DataFrame:
+    """Monta a query com as datas e a base, executa e devolve o DataFrame."""
+    df = executar_query_athena(montar_query(data_inicial, data_final, base))
 
 
 
@@ -39,169 +34,82 @@
 
 
 
-        # QTextBrowser: aceita tabelas, recuo e links (clique no arquivo abre a pasta)
-        self.text = W.QTextBrowser()
-        self.text.setObjectName("ConsoleText")
-        self.text.setOpenLinks(False)
-        self.text.anchorClicked.connect(lambda url: open_path(url.toLocalFile()))
-        self.text.document().setMaximumBlockCount(5000)
-        self.text.document().setDocumentMargin(2)
-        self.text.setPlaceholderText("O andamento da rotina aparece aqui assim que você iniciar.")
-        self.text.setFrameShape(W.QFrame.Shape.NoFrame)
-        lay.addWidget(self.text, 1)
+    def rodar(data_inicial, data_final, base: str,
+          pasta_saida: Path | None = None, pasta_upload: Path | None = None,
+          arquivo_filtros: Path | None = None, ctx=None) -> dict:
+    """
+    Executa a rotina completa para UMA base.
+    Devolve {"resultado", "info_execucao", "excel_antes", "excel_depois", "uploads", "alerta"}.
 
+    Com ctx (chamado pela tela), o resumo NÃO é impresso: a tela monta o resumo dela.
+    Sem ctx (rodando o arquivo direto), imprime o resumo no terminal como antes.
+    """
+    base = validar_base(base)
+    pasta_saida = Path(pasta_saida or cfg.pasta("eventos_saida") / base)
+    pasta_upload = Path(pasta_upload or cfg.pasta("eventos_upload"))
 
+    _avancar(ctx, 5)
+    tipos_ativo = carregar_tipos_ativo(arquivo_filtros)
+    ini, fim = pd.Timestamp(data_inicial).normalize(), pd.Timestamp(data_final).normalize()
+    posicao_de, posicao_ate = calcular_janela_posicao(ini)
+    info_execucao = {
+        "Base": base,
+        "Fluxo - data inicial": f"{ini:%d/%m/%Y}",
+        "Fluxo - data final": f"{fim:%d/%m/%Y}",
+        "Posição - data inicial": f"{posicao_de:%d/%m/%Y}",
+        "Posição - data final": f"{posicao_ate:%d/%m/%Y}",
+        "Tipos de ativo considerados": ", ".join(tipos_ativo),
+    }
 
+    _avancar(ctx, 10)
+    print("Executando a query no Athena...")
+    df = obter_dados_athena(data_inicial, data_final, base)
+    print(f"Query retornou {len(df)} linha(s).")
 
+    _avancar(ctx, 60)
+    print("Tratando o fluxo e gerando os Excel...")
+    caminho_antes, caminho_depois, resultado = gerar_excels(
+        df, data_inicial, data_final, pasta_saida,
+        levar_para_dia_util=LEVAR_PARA_DIA_UTIL, tipos_ativo=tipos_ativo, info_execucao=info_execucao,
+    )
 
+    _avancar(ctx, 85)
+    arquivos_upload = gerar_arquivos_upload(resultado, data_inicial, data_final, pasta_upload)
+    alerta = formatar_alerta_divergencias(resultado)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            def start(self, title: str):
-        self._started = datetime.now()
-        self.progress.setValue(0)
-        self._set_state("running")
-        self.btn_cancel.show()
-        self.btn_cancel.setEnabled(True)
-        self.btn_clear.setEnabled(False)
-        if not self.text.document().isEmpty():
-            self._bloco(top=14)  # respiro entre uma execução e a próxima
-        self.log(title, "title")
-        self._tick()
-        self._timer.start()
-
-    # Montagem do texto -------------------------------------------------------
-    # Níveis aceitos em log(): info, step, ok, warn, error, title, trace e os especiais
-    # section (título de seção), file (caminho de arquivo, vira link) e table (JSON).
-    _MARCAS = {"ok": "✓", "warn": "!", "error": "✕", "step": "›", "title": "▸"}
-
-    def _cores(self) -> dict:
-        t = theme.current()
-        return {
-            "info": t["con_text"], "step": t["con_info"], "ok": t["con_ok"], "warn": t["con_warn"],
-            "error": t["con_error"], "title": "#FFFFFF", "trace": t["con_muted"],
-            "muted": t["con_muted"], "section": t["con_section"], "key": t["con_key"],
-            "value": t["con_value"], "link": t["con_link"],
-        }
-
-    def _recuo(self) -> int:
-        """Largura de "00:00:00  ✓ ": as linhas quebradas alinham depois do horário."""
-        return QtGui.QFontMetrics(self.text.font()).horizontalAdvance("00:00:00  ✓ ") + 2
-
-    def _bloco(self, left: int = 0, indent: int = 0, top: int = 0) -> QtGui.QTextCursor:
-        """Abre uma linha nova no fim do documento com o recuo pedido."""
-        doc = self.text.document()
-        cur = QtGui.QTextCursor(doc)
-        cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        fmt = QtGui.QTextBlockFormat()
-        fmt.setLeftMargin(left)
-        fmt.setTextIndent(indent)
-        fmt.setTopMargin(top)
-        fmt.setLineHeight(135, QtGui.QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
-        if doc.isEmpty():
-            cur.setBlockFormat(fmt)
+    if ctx is None:  # rodando direto pelo terminal: mantém a saída de antes
+        print()
+        print(formatar_resumo_terminal(resultado, info_execucao))
+        print(f"\nExcel ANTES : {caminho_antes}")
+        print(f"Excel DEPOIS: {caminho_depois}")
+        if arquivos_upload:
+            for caminho in arquivos_upload:
+                print(f"TXT upload  : {caminho}")
         else:
-            cur.insertBlock(fmt)
-        return cur
+            print("TXT upload  : não gerado (nenhum lastro no Fluxo Tratado)")
+        if alerta:
+            print(alerta)
 
-    @staticmethod
-    def _escrever(cur, texto: str, cor: str, negrito: bool = False, href: str = ""):
-        cf = QtGui.QTextCharFormat()
-        cf.setForeground(QtGui.QColor(cor))
-        if negrito:
-            cf.setFontWeight(QtGui.QFont.Weight.DemiBold)
-        if href:
-            cf.setAnchor(True)
-            cf.setAnchorHref(href)
-            cf.setFontUnderline(True)
-        cur.insertText(texto, cf)
+    _avancar(ctx, 100)
+    return {
+        "resultado": resultado,
+        "info_execucao": info_execucao,
+        "excel_antes": caminho_antes,
+        "excel_depois": caminho_depois,
+        "uploads": arquivos_upload,
+        "alerta": alerta,
+    }
 
-    def _rolar(self):
-        sb = self.text.verticalScrollBar()
-        sb.setValue(sb.maximum())
 
-    def log(self, message: str, level: str = "info"):
-        especiais = {"section": self._secao, "file": self._arquivo, "table": self._tabela}
-        if level in especiais:
-            especiais[level](message)
-            self._rolar()
-            return
-        c = self._cores()
-        cor = c.get(level, c["info"])
-        recuo = self._recuo()
-        for i, linha in enumerate(str(message).splitlines() or [""]):
-            cur = self._bloco(left=recuo, indent=-recuo)
-            carimbo = datetime.now().strftime("%H:%M:%S") if i == 0 else " " * 8
-            self._escrever(cur, f"{carimbo}  ", c["muted"])
-            marca = self._MARCAS.get(level, " ") if i == 0 else " "
-            self._escrever(cur, f"{marca} ", cor)
-            self._escrever(cur, linha, cor, negrito=(level == "title"))
-        self._rolar()
 
-    def _secao(self, titulo: str):
-        """Título de seção (ex.: "Base LZ (1 de 2)") com espaço antes."""
-        c = self._cores()
-        cur = self._bloco(top=12)
-        self._escrever(cur, "━━ ", c["section"])
-        self._escrever(cur, titulo, c["section"], negrito=True)
 
-    def _arquivo(self, caminho: str):
-        """Arquivo gerado: nome clicável (abre a pasta) + pasta em cinza."""
-        c = self._cores()
-        p = Path(caminho)
-        cur = self._bloco(left=self._recuo() + 4)
-        self._escrever(cur, "↳ ", c["muted"])
-        self._escrever(cur, p.name, c["link"], href=QtCore.QUrl.fromLocalFile(str(p)).toString())
-        self._escrever(cur, f"   {p.parent.parent.name}\\{p.parent.name}", c["muted"])
 
-    def _tabela(self, dados: str):
-        """Tabela chave/valor. `dados` = JSON {"titulo": str, "linhas": [[chave, valor], ...]}."""
-        import json
 
-        c = self._cores()
-        info = json.loads(dados)
-        recuo = self._recuo()
-        cur = self._bloco(left=recuo, top=6)
-        self._escrever(cur, info.get("titulo", ""), c["key"], negrito=True)
 
-        linhas = info.get("linhas", [])
-        if not linhas:
-            return
-        tf = QtGui.QTextTableFormat()
-        tf.setBorder(0)
-        tf.setBorderStyle(QtGui.QTextFrameFormat.BorderStyle.BorderStyle_None)
-        tf.setCellPadding(1)
-        tf.setCellSpacing(0)
-        tf.setLeftMargin(recuo + 4)
-        tf.setColumnWidthConstraints([
-            QtGui.QTextLength(QtGui.QTextLength.Type.PercentageLength, 64),
-            QtGui.QTextLength(QtGui.QTextLength.Type.PercentageLength, 36),
-        ])
-        cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        tabela = cur.insertTable(len(linhas), 2, tf)
-        for i, (chave, valor) in enumerate(linhas):
-            texto = str(valor)
-            cor_valor = {"ERRO": c["error"], "OK": c["ok"],
-                         "COM DIVERGÊNCIA": c["warn"]}.get(texto.strip().upper(), c["value"])
-            self._escrever(tabela.cellAt(i, 0).firstCursorPosition(), str(chave), c["key"])
-            self._escrever(tabela.cellAt(i, 1).firstCursorPosition(), texto, cor_valor)
+    # antes
+    rodar(DATA_INICIAL, DATA_FINAL, BASES)
+# depois
+    rodar(DATA_INICIAL, DATA_FINAL, BASE)
 
 
 
@@ -213,6 +121,146 @@
 
 
 
+    """Ligação da tela Eventos SAC com a rotina (eventos/rodar.py).
+
+A rotina trata UMA base por vez. Com várias bases marcadas na tela, ela é
+executada uma vez para cada base, em sequência. Se uma base falhar, as
+outras continuam; no fim, a tela mostra quais deram erro.
+"""
+
+import contextlib
+import io
+import traceback
+from pathlib import Path
+
+from app.worker import Cancelled, Falha
+
+from .eventos import rodar
+from .eventos.exportacao import resumo_em_linhas
+
+
+class _ParaConsole(io.TextIOBase):
+    """Manda cada print() da rotina para o console da tela, com cor conforme o conteúdo."""
+
+    def __init__(self, ctx):
+        self.ctx, self._buf = ctx, ""
+
+    def write(self, texto):
+        self._buf += texto
+        while "\n" in self._buf:
+            linha, self._buf = self._buf.split("\n", 1)
+            linha = linha.rstrip()
+            if not linha.strip() or set(linha.strip()) <= {"!", "="}:
+                continue  # linhas vazias e "!!!!" / "====" de enfeite do terminal
+            if linha.lower().startswith("erro"):
+                nivel = "error"
+            elif "ATENÇÃO" in linha:
+                nivel = "warn"
+            else:
+                nivel = "step"
+            self.ctx.log(linha.strip(), nivel)
+        return len(texto)
+
+
+class _CtxDaBase:
+    """Repassa tudo para o ctx da tela, mas converte o progresso de uma base (0-100)
+    para a fatia dela no total (ex.: 2 bases -> a 1ª vai de 0 a 50, a 2ª de 50 a 100)."""
+
+    def __init__(self, ctx, indice: int, total: int):
+        self._ctx, self._i, self._n = ctx, indice, total
+
+    def progress(self, pct):
+        self._ctx.progress((self._i + pct / 100) / self._n * 100)
+
+    def __getattr__(self, nome):  # log, check, section, table, file, cancelled...
+        return getattr(self._ctx, nome)
+
+
+def _mostrar_resultado(ctx, saida: dict) -> None:
+    """Resumo organizado em tabelas + arquivos gerados (com link)."""
+    secoes: dict[str, list] = {}
+    for secao, item, valor in resumo_em_linhas(saida["resultado"], saida["info_execucao"]):
+        secoes.setdefault(secao, []).append((item, valor))
+    for secao, linhas in secoes.items():
+        ctx.table(secao, linhas)
+
+    ctx.log("Arquivos gerados", "info")
+    ctx.file(saida["excel_antes"])
+    ctx.file(saida["excel_depois"])
+    if saida["uploads"]:
+        for caminho in saida["uploads"]:
+            ctx.file(caminho)
+    else:
+        ctx.log("TXT de upload não gerado (nenhum lastro no Fluxo Tratado)", "warn")
+
+    if saida["alerta"]:
+        for linha in saida["alerta"].splitlines():
+            if linha.strip() and set(linha.strip()) - {"!"}:
+                ctx.log(linha.strip(), "warn")
+
+
+def executar(params: dict, ctx) -> str:
+    """Chamado pela tela Eventos SAC quando o usuário clica em Processar."""
+    bases = params["bases"]
+    total = len(bases)
+    uploads, falhas, divergencias = 0, [], []
+
+    for i, base in enumerate(bases):
+        ctx.check()
+        ctx.section(f"Base {base}" + (f"  ({i + 1} de {total})" if total > 1 else ""))
+        ctx_base = _CtxDaBase(ctx, i, total)
+        try:
+            with contextlib.redirect_stdout(_ParaConsole(ctx)):
+                saida = rodar.rodar(
+                    params["inicio"], params["fim"], base,
+                    pasta_saida=Path(params["saida"]) / base,   # Saida/<BASE>/fluxo_...xlsx
+                    pasta_upload=params["upload"],             # Upload/<BASE>/fluxo_<BASE>_...txt
+                    arquivo_filtros=params["filtros"],
+                    ctx=ctx_base,
+                )
+        except Cancelled:
+            raise
+        except PermissionError as exc:
+            falhas.append(base)
+            ctx.log(f"Não foi possível gravar {exc.filename}. "
+                    "Se o arquivo estiver aberto no Excel, feche e rode de novo.", "error")
+            continue
+        except Exception as exc:  # noqa: BLE001 - uma base com erro não para as outras
+            falhas.append(base)
+            ctx.log(f"Base {base} falhou: {exc}", "error")
+            if not isinstance(exc, (RuntimeError, ValueError, FileNotFoundError)):
+                # erro inesperado: mostra onde aconteceu (em cinza), para facilitar a correção
+                ctx.log(traceback.format_exc().rstrip(), "trace")
+            continue
+
+        _mostrar_resultado(ctx, saida)
+        uploads += len(saida["uploads"])
+        if saida["alerta"]:
+            divergencias.append(base)
+        ctx.log(f"Base {base} concluída", "ok")
+
+    # Fechamento geral ---------------------------------------------------------
+    if total > 1:
+        ctx.section("Resumo geral")
+        ctx.table("Bases", [(b, "ERRO" if b in falhas else ("com divergência" if b in divergencias else "OK"))
+                            for b in bases])
+    if falhas:
+        raise Falha(f"{len(falhas)} de {total} base(s) com erro: {', '.join(falhas)}."
+                    + (" As demais foram geradas normalmente." if len(falhas) < total else ""))
+    if divergencias:
+        ctx.log(f"Divergência na soma das amortizações (I) em: {', '.join(divergencias)}. "
+                "Veja a aba 'Divergência de Amortização' no Excel DEPOIS.", "warn")
+    return (f"Eventos SAC concluído: {total} base(s), "
+            f"{uploads} arquivo(s) de upload gerado(s).")
+
+
+
+
+
+
+                # Console maior nesta tela (o padrão da BasePage é 11 para o painel e 9 para o console)
+    FORM_STRETCH = 9
+    CONSOLE_STRETCH = 11
 
 
 
@@ -220,40 +268,6 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                def clear(self):
-        self.text.clear()
-        self.text.document().setDocumentMargin(2)
-        ...
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            
+        self.f_bases = Field("Bases", self.bases, "Com mais de uma base, a rotina roda uma vez para cada.")
+        self.bases.changed.connect(
+            lambda sel: self.f_bases.set_hint("Com mais de uma base, a rotina roda uma vez para cada."))
