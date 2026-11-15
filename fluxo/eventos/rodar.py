@@ -23,7 +23,8 @@ import pyodbc                                   # noqa: E402
 from bizdays import Calendar                    # noqa: E402
 
 from aws.query_eventos import QUERY_EVENTOS     # noqa: E402
-from eventos.exportacao import formatar_resumo_terminal, gerar_arquivos_upload, gerar_excels   # noqa: E402
+from eventos.exportacao import (formatar_alerta_divergencias, formatar_resumo_terminal,  # noqa: E402
+                                gerar_arquivos_upload, gerar_excels)
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -155,6 +156,10 @@ def rodar(data_inicial: str, data_final: str):
             print(f"TXT upload  : {caminho}")
     else:
         print("TXT upload  : não gerado (nenhum lastro no Fluxo Tratado)")
+
+    alerta = formatar_alerta_divergencias(resultado)
+    if alerta:
+        print(alerta)
     return resultado
 
 
