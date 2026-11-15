@@ -1,7 +1,7 @@
 """
 Tratamento de Fluxos de Ativos — lógica Python sobre o resultado da query.
 
-Entrada: DataFrame com o resultado de `query_fluxo_completo.sql` (Athena),
+Entrada: DataFrame com o resultado de `aws/query_eventos.py` (Athena),
 mais a data inicial e a data final usadas na query.
 
 REGRAS
@@ -17,8 +17,8 @@ R0. Intervalo e dia útil
 Para cada grupo (lastro + codigo_clearing + dia útil):
 R1. Eventos L e B são sempre excluídos.
 R2. O grupo sempre termina com um I. Se não houver, inclui-se um I com
-    0,0000000001. Se já houver, nada é incluído e ele mantém seu percentual.
-R3. Se havia L ou B e existe J, o percentual do J vai para 0,0000000001.
+    0,00000000000001. Se já houver, nada é incluído e ele mantém seu percentual.
+R3. Se havia L ou B e existe J, o percentual do J vai para 0,00000000000001.
     M é sempre mantido.
 R4. A nova linha I copia a linha J do grupo. Sem J, copia a primeira linha
     do grupo.
@@ -26,7 +26,7 @@ R4. A nova linha I copia a linha J do grupo. Sem J, copia a primeira linha
 Lastro irmão sem evento:
 R5. Para cada ativo (codigo_clearing) e dia útil em que algum lastro dele tem
     evento, todo outro lastro do mesmo ativo presente nos dados que não tenha
-    evento nesse dia útil recebe J + I, ambos com 0,0000000001.
+    evento nesse dia útil recebe J + I, ambos com 0,00000000000001.
     Demais colunas: do cadastro do próprio lastro.
     (A exigência de posição para os dois lastros já é aplicada na query.)
 
@@ -43,20 +43,49 @@ R9. Ligada (padrão):
       - Linha nova I usa a data do J copiado; o par J + I usa a data do J do
         irmão (o mais antigo) ou, sem J, a do primeiro evento do irmão.
 
-Pendências (o lastro/grupo NÃO é alterado em nada, nem a data):
+Pendências — o lastro INTEIRO fica fora do fluxo final, sem nenhuma
+alteração (nem data), e não recebe par J + I como irmão:
 R6. Evento repetido no mesmo grupo (não deveria ocorrer: erro de dados).
 R7. Código de evento fora de I, J, M, L, B.
-R8. Lastro sem codigo_clearing (sem cadastro).
+R8. Lastro sem codigo_clearing (sem cadastro) ou com codigo_clearing = 0.
+    Basta uma pendência em um dia útil para o lastro todo sair.
+
+Títulos públicos, fora da análise e vencendo — o lastro INTEIRO fica fora do
+tratamento e do fluxo final, sem nenhuma alteração, e não recebe nem gera par J + I:
+R15. Lastro do Fluxo Tratado cuja soma de I não fecha 100: sai do Fluxo
+     Tratado e do TXT de upload e vai para a aba "Divergência de Amortização".
+R14. Título público: alguma posição na janela com indicador_publico_privado = 'U'
+     (coluna titulo_publico = 'S' na query). Separado ANTES de qualquer outra
+     regra (não cai em Fora da Análise, pendência ou vencendo) -> aba
+     "Títulos Públicos".
+R11. tipo_ativo fora da lista configurada (config/filtros.json: tipos que ENTRAM).
+     Os valores aceitam '%' como no LIKE do SQL ('CRI%', '%CRI%'); sem '%' é
+     exato. Maiúsculas/minúsculas são ignoradas.
+R12. indicador_compromissada = 'S' (cadastro do lastro).
+     R11 vai para a aba "Fora da Análise"; R12 para a aba "Compromissadas".
+R13. data_vencimento dentro do intervalo do evento: lastro vencendo, não é
+     erro e não precisa de atuação -> aba "Lastros Vencendo".
+     Lastros sem cadastro continuam como pendência (R8).
+
+Validação de amortização (após todo o tratamento):
+R10. Para cada lastro do fluxo final, a soma do percentual de TODOS os
+     eventos I (fluxo completo) deve ser 100, com tolerância de 0,000001
+     (os I de 0,00000000000001 não pesam). Consolidado: soma de todos os lastros
+     = quantidade de lastros x 100. Lastros em pendência não entram.
+     Nada é ajustado: divergências só são sinalizadas.
 
 Saída:
-- Fluxo tratado = fluxo FINAL completo de todos os lastros (eventos excluídos
-  não aparecem; ficam só no log).
+- Fluxo tratado = fluxo FINAL completo dos lastros que sobem para o arquivo
+  (eventos excluídos não aparecem; ficam só no log).
+- Fluxo das pendências (como veio da query), validação por lastro e
+  consolidada.
 - Log de alterações, diagnóstico por grupo, pendências e resumo.
 - Percentuais em pontos percentuais (100 = 100%).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -74,7 +103,11 @@ COL_TIPO = "tipo_ativo"
 COL_VENCIMENTO = "data_vencimento"
 COL_ATIVO = "codigo_clearing"
 COL_ORIGEM = "origem_selecao"
-COL_DATA_ORIGINAL = "data_evento_original"   # criada quando levar_para_dia_util=True
+COL_COMPROMISSADA = "indicador_compromissada"
+COL_TITULO_PUBLICO = "titulo_publico"         # 'S' = posição com indicador_publico_privado = 'U'
+COL_DATA_ORIGINAL = "data_evento_original"   # Fluxo Tratado, quando levar_para_dia_util=True
+COL_DATA_AJUSTADA = "data_evento_ajustada"   # Fluxo Sem Alteração: dia útil, só para consulta
+COL_ABA = "Aba"                               # aba Validações
 
 COLUNAS_OBRIGATORIAS = [COL_LASTRO, COL_DATA, COL_EVENTO, COL_PERCENTUAL, COL_ATIVO]
 # Colunas que descrevem o evento; todas as outras são dados do lastro (cadastro).
@@ -88,7 +121,7 @@ _ORDEM = "_ordem"
 _DIA_UTIL = "_dia_util"
 _MARCA = "_marca"
 
-PERCENTUAL_MINIMO = 1e-10
+PERCENTUAL_MINIMO = 1e-14
 
 EVENTO_I, EVENTO_J, EVENTO_M, EVENTO_L, EVENTO_B = "I", "J", "M", "L", "B"
 EVENTOS_CONHECIDOS = {EVENTO_I, EVENTO_J, EVENTO_M, EVENTO_L, EVENTO_B}
@@ -112,6 +145,11 @@ CASOS_DOCUMENTADOS: dict[frozenset[str], str] = {
     frozenset({EVENTO_J, EVENTO_L}): CASO_5,
 }
 
+# Validação de amortização
+PERCENTUAL_TOTAL = 100.0
+TOLERANCIA_AMORTIZACAO = 1e-6    # pontos percentuais, por lastro
+STATUS_OK, STATUS_ERRO = "OK", "ERRO"
+
 TIPO_INCLUSAO = "INCLUSAO"
 TIPO_EXCLUSAO = "EXCLUSAO"
 TIPO_ALTERACAO = "ALTERACAO_PERCENTUAL"
@@ -122,6 +160,11 @@ MARCA_INCLUIDA = "incluida"
 MARCA_EXCLUIDA = "excluida"
 MARCA_J_ALTERADO = "j_alterado"
 MARCA_DATA = "data_alterada"
+MARCA_PENDENCIA = "pendencia"
+MARCA_FORA_ANALISE = "fora_analise"
+MARCA_COMPROMISSADA = "compromissada"
+MARCA_VENCENDO = "vencendo"
+MARCA_TITULO_PUBLICO = "titulo_publico"
 
 COL_LOG_DIA_UTIL = "Dia Útil"
 COLUNAS_LOG = [
@@ -158,21 +201,64 @@ class CalendarioANBIMA:
 # ---------------------------------------------------------------------------
 @dataclass
 class ResultadoProcessamento:
-    fluxo_tratado: pd.DataFrame
+    fluxo_tratado: pd.DataFrame          # lastros com alteração real (o que sobe para o sistema)
     log_alteracoes: pd.DataFrame
     diagnostico: pd.DataFrame
     pendencias: pd.DataFrame
+    fluxo_sem_alteracao: pd.DataFrame = field(default_factory=pd.DataFrame)  # já vieram certos
+    fluxo_divergencia: pd.DataFrame = field(default_factory=pd.DataFrame)    # tratados com soma de I != 100
+    fluxo_pendencias: pd.DataFrame = field(default_factory=pd.DataFrame)  # fluxo dos lastros em pendência
+    fluxo_fora_analise: pd.DataFrame = field(default_factory=pd.DataFrame)  # tipo fora do filtro
+    fluxo_compromissadas: pd.DataFrame = field(default_factory=pd.DataFrame)  # indicador_compromissada = S
+    fluxo_vencendo: pd.DataFrame = field(default_factory=pd.DataFrame)      # vencimento dentro do intervalo
+    fluxo_titulos_publicos: pd.DataFrame = field(default_factory=pd.DataFrame)  # posição pública (U)
+    filtros: dict = field(default_factory=dict)                             # quais filtros foram aplicados
+    tipos_encontrados: dict = field(default_factory=dict)  # {"entraram": {tipo: (padrão, qtd)}, "fora": {tipo: qtd}}
+    validacao_lastros: pd.DataFrame = field(default_factory=pd.DataFrame)
+    validacao_consolidada: dict = field(default_factory=dict)
     resumo: dict = field(default_factory=dict)
     # Marca de cada linha (para colorir o Excel):
     #   marcas_antes  -> alinhada às linhas do DataFrame de entrada (mesma ordem)
     #   marcas_depois -> alinhada às linhas de fluxo_tratado
     marcas_antes: list = field(default_factory=list)
     marcas_depois: list = field(default_factory=list)
+    marcas_sem_alteracao: list = field(default_factory=list)
+    marcas_divergencia: list = field(default_factory=list)
+    lastros_recebidos: int = 0
+    linhas_recebidas: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Preparação
 # ---------------------------------------------------------------------------
+def _padrao_tipo(padrao: str) -> re.Pattern:
+    """
+    Converte um padrão do filtros.json em regex, como o LIKE do SQL:
+    '%' = qualquer sequência de caracteres (inclusive nenhuma). Sem '%', é exato.
+    Maiúsculas e minúsculas são ignoradas. Ex.: 'CRI%', '%CRI', '%CRI%'.
+    """
+    partes = [re.escape(p) for p in str(padrao).strip().split("%")]
+    return re.compile("^" + ".*".join(partes) + "$", re.IGNORECASE)
+
+
+def _tipo_casa(tipo, padroes: list[tuple[str, re.Pattern]]) -> str | None:
+    """Devolve o primeiro padrão do filtros.json que casa com o tipo, ou None."""
+    if tipo is None or pd.isna(tipo):
+        return None
+    texto = str(tipo).strip()
+    return next((origem for origem, regex in padroes if regex.match(texto)), None)
+
+
+def _clearing_invalido(serie: pd.Series) -> pd.Series:
+    """
+    codigo_clearing sem cadastro válido: vazio, em branco ou zero
+    ("0", "00", "0.0", 0). Um código que só COMEÇA com zero não entra aqui.
+    """
+    texto = serie.astype("string").str.strip()
+    zero = texto.str.fullmatch(r"0+(\.0+)?").fillna(False).astype(bool)
+    return (texto.isna() | texto.eq("").fillna(False) | zero).astype(bool)
+
+
 def _eh_linha_vazia(df: pd.DataFrame) -> pd.Series:
     """Linha de lastro sem nenhum evento (vem da query só com dados de cadastro)."""
     return df[COLUNAS_DO_EVENTO].isna().all(axis=1)
@@ -257,6 +343,85 @@ def _nova_linha(modelo: pd.Series, data, evento: str, ordem: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Separação: fora da análise e vencendo
+# ---------------------------------------------------------------------------
+def _separar_lastros(trabalho, ini, fim, tipos_ativo, excluir_compromissada):
+    """
+    Decide, por lastro, quem NÃO passa pelo tratamento, nesta ordem
+    (cada lastro cai em uma única categoria):
+      1. título público (titulo_publico = 'S')       -> aba Títulos Públicos
+         (inclusive sem cadastro: não vira pendência)
+      -- lastros sem cadastro (sem codigo_clearing) seguem como pendência (R8) --
+      2. compromissada (indicador_compromissada = 'S') -> aba Compromissadas
+      3. tipo_ativo fora da lista configurada          -> aba Fora da Análise
+      4. data_vencimento dentro do intervalo           -> aba Lastros Vencendo
+    Retorna (publicos, compromissadas, fora_tipo, vencendo, filtros).
+    """
+    filtros = {}
+
+    publicos: set = set()
+    if COL_TITULO_PUBLICO in trabalho.columns:
+        flag = trabalho[COL_TITULO_PUBLICO].astype("string").str.strip().str.upper()
+        publicos = set(trabalho.loc[flag == "S", COL_LASTRO])
+        filtros["Separação de títulos públicos"] = "aplicada"
+    else:
+        print(f"ATENÇÃO: a coluna {COL_TITULO_PUBLICO} não veio na query; títulos públicos não foram separados.")
+        filtros["Separação de títulos públicos"] = "NÃO aplicada (coluna ausente)"
+
+    cadastro = (trabalho[~_clearing_invalido(trabalho[COL_ATIVO]) & ~trabalho[COL_LASTRO].isin(publicos)]
+                .drop_duplicates(COL_LASTRO).set_index(COL_LASTRO))
+
+    aplicar_compromissada = excluir_compromissada and COL_COMPROMISSADA in trabalho.columns
+    if excluir_compromissada and not aplicar_compromissada:
+        print(f"ATENÇÃO: a coluna {COL_COMPROMISSADA} não veio na query; "
+              "as compromissadas NÃO foram separadas.")
+    filtros["Separação de compromissadas"] = ("aplicada" if aplicar_compromissada
+                                              else "NÃO aplicada (coluna ausente)" if excluir_compromissada
+                                              else "não aplicada")
+    compromissadas: set = set()
+    if aplicar_compromissada:
+        flag = cadastro[COL_COMPROMISSADA].astype("string").str.strip().str.upper()
+        compromissadas = set(cadastro.index[flag == "S"])
+
+    fora_tipo: set = set()
+    tipos_encontrados: dict = {}
+    if tipos_ativo is not None:
+        if COL_TIPO not in trabalho.columns:
+            raise ValueError(f"Filtro de tipos configurado, mas a coluna {COL_TIPO} não veio na query.")
+        origens = [str(t).strip() for t in tipos_ativo if str(t).strip()]
+        padroes = [(origem, _padrao_tipo(origem)) for origem in origens]
+        filtros["Filtro de tipos de ativo"] = f"aplicado ({', '.join(origens)})"
+
+        avaliados = cadastro[~cadastro.index.isin(list(compromissadas))]
+        casou = {lastro: _tipo_casa(tipo, padroes) for lastro, tipo in avaliados[COL_TIPO].items()}
+        fora_tipo = {lastro for lastro, padrao in casou.items() if padrao is None}
+
+        # Para o resumo: quais tipos entraram (e por qual padrão) e quais ficaram de fora
+        entraram: dict = {}
+        fora: dict = {}
+        for lastro, padrao in casou.items():
+            tipo = avaliados.at[lastro, COL_TIPO]
+            nome = "(vazio)" if pd.isna(tipo) else str(tipo).strip()
+            if padrao is None:
+                fora[nome] = fora.get(nome, 0) + 1
+            else:
+                qtd = entraram.get(nome, (padrao, 0))[1]
+                entraram[nome] = (padrao, qtd + 1)
+        tipos_encontrados = {"entraram": dict(sorted(entraram.items())), "fora": dict(sorted(fora.items()))}
+    else:
+        filtros["Filtro de tipos de ativo"] = "não aplicado"
+
+    vencendo: set = set()
+    if COL_VENCIMENTO in trabalho.columns:
+        venc = pd.to_datetime(cadastro[COL_VENCIMENTO], errors="coerce").dt.normalize()
+        vencendo = set(venc.index[venc.between(ini, fim)]) - compromissadas - fora_tipo
+    else:
+        print(f"ATENÇÃO: a coluna {COL_VENCIMENTO} não veio na query; lastros vencendo não foram separados.")
+
+    return publicos, compromissadas, fora_tipo, vencendo, filtros, tipos_encontrados
+
+
+# ---------------------------------------------------------------------------
 # Processamento
 # ---------------------------------------------------------------------------
 def processar_eventos(
@@ -265,6 +430,8 @@ def processar_eventos(
     data_final,
     calendario: Calendario | None = None,
     levar_para_dia_util: bool = True,
+    tipos_ativo: list[str] | None = None,
+    excluir_compromissada: bool = True,
 ) -> ResultadoProcessamento:
     ini = pd.Timestamp(data_inicial).normalize()
     fim = pd.Timestamp(data_final).normalize()
@@ -277,10 +444,16 @@ def processar_eventos(
     trabalho[_MARCA] = None
     trabalho[COL_DATA_ORIGINAL] = trabalho[COL_DATA]
     vazia = _eh_linha_vazia(trabalho)
-    sem_ativo = trabalho[COL_ATIVO].isna()
+    sem_ativo = _clearing_invalido(trabalho[COL_ATIVO])   # vazio ou zero (R8)
+
+    # --- R14, R12, R11, R13: públicos, compromissadas, tipo fora, vencendo ---
+    publicos, compromissadas, fora_tipo, lastros_vencendo, filtros, tipos_encontrados = _separar_lastros(
+        trabalho, ini, fim, tipos_ativo, excluir_compromissada)
+    fora_do_tratamento = trabalho[COL_LASTRO].isin(publicos | compromissadas | fora_tipo | lastros_vencendo)
+    sem_ativo = sem_ativo & ~trabalho[COL_LASTRO].isin(publicos)   # público sem cadastro não é pendência
 
     no_intervalo = trabalho[
-        ~vazia & trabalho[COL_DATA].dt.normalize().between(ini, fim)
+        ~vazia & ~fora_do_tratamento & trabalho[COL_DATA].dt.normalize().between(ini, fim)
     ].copy()
     mapa_dia_util = {d: calendario.proximo_dia_util(d) for d in no_intervalo[COL_DATA].dt.normalize().unique()}
     no_intervalo[_DIA_UTIL] = no_intervalo[COL_DATA].dt.normalize().map(mapa_dia_util)
@@ -292,27 +465,41 @@ def processar_eventos(
     log: list[dict] = []
     diagnostico: list[dict] = []
 
-    # --- R8: lastros sem codigo_clearing -> pendência, sem alteração --------
-    for lastro, _ in trabalho[sem_ativo].groupby(COL_LASTRO, sort=False):
+    # --- R8: lastros sem codigo_clearing (vazio ou zero) -> pendência -----
+    for lastro, linhas in trabalho[sem_ativo].groupby(COL_LASTRO, sort=False):
         ev = no_intervalo[no_intervalo[COL_LASTRO] == lastro]
+        clearing = linhas[COL_ATIVO].iloc[0]
+        motivo = ("Lastro sem codigo_clearing (sem cadastro)" if pd.isna(clearing) or str(clearing).strip() == ""
+                  else f"Lastro com codigo_clearing = {str(clearing).strip()} (sem cadastro válido)")
         diagnostico.append({
-            COL_ATIVO: None, COL_LASTRO: lastro, COL_LOG_DIA_UTIL: None,
+            COL_ATIVO: clearing, COL_LASTRO: lastro, COL_LOG_DIA_UTIL: None,
             "Datas Cadastradas": _datas_txt(ev[COL_DATA]),
             "Eventos Originais": "+".join(sorted(ev[COL_EVENTO])),
             "Eventos Finais": "+".join(sorted(ev[COL_EVENTO])),
             "Caso": PENDENCIA, "Ações": "nenhuma",
-            "Observação": "Lastro sem codigo_clearing (sem cadastro)",
+            "Observação": motivo,
         })
 
-    grupos_validos = no_intervalo[no_intervalo[COL_ATIVO].notna()]
+    grupos_validos = no_intervalo[~_clearing_invalido(no_intervalo[COL_ATIVO])]
+
+    # --- Pendência vale para o lastro INTEIRO: ele sai do fluxo final -------
+    lastros_pendencia: set = set(trabalho.loc[sem_ativo, COL_LASTRO])
+    classificacao: dict = {}
+    for chave, grupo in grupos_validos.groupby(CHAVE_ATIVO + [_DIA_UTIL], sort=False):
+        classificacao[chave] = classificar_grupo(grupo[COL_EVENTO].tolist())
+        if classificacao[chave][0] == PENDENCIA:
+            lastros_pendencia.add(chave[0])
 
     # --- R1-R4 (+ R9): regras por (lastro, ativo, dia útil) ----------------
     for (lastro, ativo, dia_util), grupo in grupos_validos.groupby(CHAVE_ATIVO + [_DIA_UTIL], sort=False):
         eventos = grupo[COL_EVENTO].tolist()
-        caso, motivo = classificar_grupo(eventos)
+        caso, motivo = classificacao[(lastro, ativo, dia_util)]
+        em_pendencia = lastro in lastros_pendencia
+        if em_pendencia and caso != PENDENCIA:
+            motivo = "Lastro fora do arquivo final: pendência em outro dia útil"
         acoes: list[str] = []
 
-        if caso != PENDENCIA:
+        if not em_pendencia:
             tem_l_ou_b = bool(EVENTOS_EXCLUIDOS & set(eventos))
             linhas_j = grupo[grupo[COL_EVENTO] == EVENTO_J]
 
@@ -357,7 +544,7 @@ def processar_eventos(
                 log.append(_entrada_log(modelo, dia_util, caso, TIPO_INCLUSAO, None, data_i,
                                         None, EVENTO_I, None, PERCENTUAL_MINIMO))
 
-        if caso == PENDENCIA:
+        if em_pendencia:
             finais = eventos
         else:
             finais = [e for e in eventos if e not in EVENTOS_EXCLUIDOS]
@@ -376,14 +563,15 @@ def processar_eventos(
 
     # --- R5: lastro irmão sem evento no dia útil -----------------------------
     lastros_por_ativo = (
-        trabalho[~sem_ativo].sort_values(_ORDEM)
+        trabalho[~sem_ativo & ~fora_do_tratamento].sort_values(_ORDEM)
         .groupby(COL_ATIVO, sort=False)[COL_LASTRO].unique()
     )
     proxima_ordem = float(len(trabalho))
 
     for (ativo, dia_util), grupo_ativo in grupos_validos.groupby([COL_ATIVO, _DIA_UTIL], sort=False):
         com_evento = set(grupo_ativo[COL_LASTRO])
-        faltantes = [l for l in lastros_por_ativo[ativo] if l not in com_evento]
+        faltantes = [l for l in lastros_por_ativo[ativo]
+                     if l not in com_evento and l not in lastros_pendencia]
         if not faltantes:
             continue
 
@@ -412,6 +600,21 @@ def processar_eventos(
                 "Observação": f"Sem evento no dia útil; irmão(s) com evento: {', '.join(map(str, irmaos))}",
             })
 
+    # --- Tratado x sem alteração -------------------------------------------
+    # Tratado = teve inclusão, exclusão ou J alterado. Só mudar a data não conta:
+    # o sistema já leva o evento para o dia útil, então a data não é alterada.
+    lastros_tratados = (set(trabalho.loc[indices_excluir, COL_LASTRO])
+                        | set(trabalho.loc[list(alteracoes_percentual), COL_LASTRO])
+                        | {n[COL_LASTRO] for n in novas_linhas})
+    alteracoes_data = {idx: d for idx, d in alteracoes_data.items()
+                       if trabalho.loc[idx, COL_LASTRO] in lastros_tratados}
+    log = [e for e in log
+           if not (e["Tipo de Alteração"] == TIPO_ALTERACAO_DATA and e[COL_LASTRO] not in lastros_tratados)]
+    for d in diagnostico:
+        if d[COL_LASTRO] not in lastros_tratados and str(d["Ações"]).startswith("data ->"):
+            d["Ações"] = "nenhuma"
+            d["Observação"] = "Sem alteração: data mantida (dia útil em data_evento_ajustada)"
+
     # --- Marcas das linhas de entrada (Excel ANTES) -------------------------
     for idx in alteracoes_data:
         trabalho.loc[idx, _MARCA] = MARCA_DATA
@@ -419,10 +622,58 @@ def processar_eventos(
         trabalho.loc[idx, _MARCA] = MARCA_J_ALTERADO
     for idx in indices_excluir:
         trabalho.loc[idx, _MARCA] = MARCA_EXCLUIDA
+    trabalho.loc[trabalho[COL_LASTRO].isin(lastros_pendencia) & ~vazia, _MARCA] = MARCA_PENDENCIA
+    trabalho.loc[trabalho[COL_LASTRO].isin(fora_tipo), _MARCA] = MARCA_FORA_ANALISE
+    trabalho.loc[trabalho[COL_LASTRO].isin(compromissadas), _MARCA] = MARCA_COMPROMISSADA
+    trabalho.loc[trabalho[COL_LASTRO].isin(lastros_vencendo), _MARCA] = MARCA_VENCENDO
+    trabalho.loc[trabalho[COL_LASTRO].isin(publicos), _MARCA] = MARCA_TITULO_PUBLICO
     marcas_antes = trabalho[_MARCA].where(trabalho[_MARCA].notna(), None).tolist()
     trabalho.loc[indices_excluir, _MARCA] = None
+    trabalho.loc[trabalho[_MARCA].isin([MARCA_PENDENCIA, MARCA_FORA_ANALISE, MARCA_VENCENDO,
+                                         MARCA_TITULO_PUBLICO, MARCA_COMPROMISSADA]), _MARCA] = None
 
-    # --- Montagem do fluxo final -------------------------------------------
+    # --- Fora da análise e vencendo: saem do fluxo final, sem alteração ----
+    def _fluxo_bruto(mascara: pd.Series) -> pd.DataFrame:
+        return (trabalho[mascara]
+                .sort_values([COL_ATIVO, COL_LASTRO, COL_DATA, _ORDEM], kind="stable", na_position="last")
+                .drop(columns=[_ORDEM, _MARCA, COL_DATA_ORIGINAL])
+                .reset_index(drop=True))
+
+    fluxo_fora_analise = _fluxo_bruto(trabalho[COL_LASTRO].isin(fora_tipo))
+    fluxo_compromissadas = _fluxo_bruto(trabalho[COL_LASTRO].isin(compromissadas))
+    fluxo_vencendo = _fluxo_bruto(trabalho[COL_LASTRO].isin(lastros_vencendo))
+    fluxo_titulos_publicos = _fluxo_bruto(trabalho[COL_LASTRO].isin(publicos))
+    trabalho = trabalho[~fora_do_tratamento]
+    vazia = _eh_linha_vazia(trabalho)
+
+    # --- Lastros em pendência: saem do fluxo final, sem nenhuma alteração ---
+    em_pend = trabalho[COL_LASTRO].isin(lastros_pendencia)
+    fluxo_pendencias = (
+        trabalho[em_pend & ~vazia]
+        .sort_values([COL_ATIVO, COL_LASTRO, COL_DATA, _ORDEM], kind="stable", na_position="last")
+        .drop(columns=[_ORDEM, _MARCA, COL_DATA_ORIGINAL])
+        .reset_index(drop=True)
+    )
+    trabalho = trabalho[~em_pend]
+
+    # --- Fluxo sem alteração: como veio, com o dia útil só para consulta ----
+    sem_alt = trabalho[~trabalho[COL_LASTRO].isin(lastros_tratados)].copy()
+    sem_alt[COL_DATA_AJUSTADA] = no_intervalo[_DIA_UTIL].reindex(sem_alt.index)
+    sem_alt = sem_alt.sort_values([COL_ATIVO, COL_LASTRO, COL_DATA, _ORDEM], kind="stable", na_position="last")
+    marcas_sem_alteracao = [
+        MARCA_DATA if pd.notna(aj) and aj != pd.Timestamp(dt).normalize() else None
+        for dt, aj in zip(sem_alt[COL_DATA], sem_alt[COL_DATA_AJUSTADA])
+    ]
+    fluxo_sem_alteracao = sem_alt.drop(columns=[_ORDEM, _MARCA, COL_DATA_ORIGINAL]).reset_index(drop=True)
+    colunas = list(fluxo_sem_alteracao.columns)
+    colunas.remove(COL_DATA_AJUSTADA)
+    colunas.insert(colunas.index(COL_DATA) + 1, COL_DATA_AJUSTADA)
+    fluxo_sem_alteracao = fluxo_sem_alteracao[colunas]
+    fluxo_sem_alteracao[COL_DATA_AJUSTADA] = pd.to_datetime(fluxo_sem_alteracao[COL_DATA_AJUSTADA])
+    fluxo_sem_alteracao[COL_EVENTO] = fluxo_sem_alteracao[COL_EVENTO].astype("string")
+    trabalho = trabalho[trabalho[COL_LASTRO].isin(lastros_tratados)]
+
+    # --- Montagem do fluxo tratado -----------------------------------------
     for idx, valor in alteracoes_percentual.items():
         trabalho.loc[idx, COL_PERCENTUAL] = valor
     for idx, nova_data in alteracoes_data.items():
@@ -454,9 +705,20 @@ def processar_eventos(
 
     return ResultadoProcessamento(
         fluxo_tratado=fluxo_tratado,
+        fluxo_sem_alteracao=fluxo_sem_alteracao,
+        marcas_sem_alteracao=marcas_sem_alteracao,
+        lastros_recebidos=int(dados[COL_LASTRO].nunique()),
+        linhas_recebidas=len(dados),
         log_alteracoes=registrar_alteracoes(log),
         diagnostico=df_diag,
         pendencias=pendencias,
+        fluxo_pendencias=fluxo_pendencias,
+        fluxo_fora_analise=fluxo_fora_analise,
+        fluxo_compromissadas=fluxo_compromissadas,
+        fluxo_vencendo=fluxo_vencendo,
+        fluxo_titulos_publicos=fluxo_titulos_publicos,
+        filtros=filtros,
+        tipos_encontrados=tipos_encontrados,
         marcas_antes=marcas_antes,
         marcas_depois=marcas_depois,
     )
@@ -468,42 +730,133 @@ def registrar_alteracoes(entradas: list[dict]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Validação de amortização (Etapa 3)
+# ---------------------------------------------------------------------------
+def validar_amortizacoes(
+    fluxo_tratado: pd.DataFrame,
+    dados_originais: pd.DataFrame,
+    tolerancia: float = TOLERANCIA_AMORTIZACAO,
+    fluxo_sem_alteracao: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Soma o percentual de TODOS os eventos I do fluxo completo de cada lastro
+    do fluxo final e compara com 100 (com tolerância). Também faz a validação
+    consolidada: soma de todos os lastros = quantidade de lastros x 100.
+
+    Valida o Fluxo Tratado e o Fluxo Sem Alteração (coluna "Aba" indica qual).
+    Lastros em pendência, públicos, compromissadas, fora da análise e vencendo
+    ficam de fora. Nenhum percentual é ajustado: apenas sinaliza.
+    """
+    partes = [fluxo_tratado.assign(**{COL_ABA: "Fluxo Tratado"})]
+    if fluxo_sem_alteracao is not None and len(fluxo_sem_alteracao):
+        partes.append(fluxo_sem_alteracao.assign(**{COL_ABA: "Fluxo Sem Alteração"}))
+    fluxo_tratado = pd.concat(partes, ignore_index=True)
+
+    def soma_i(df: pd.DataFrame) -> pd.Series:
+        return df[df[COL_EVENTO] == EVENTO_I].groupby(CHAVE_ATIVO)[COL_PERCENTUAL].sum()
+
+    colunas_id = CHAVE_ATIVO + [COL_ABA] + ([COL_ORIGEM] if COL_ORIGEM in fluxo_tratado.columns else [])
+    validacao = fluxo_tratado[colunas_id].drop_duplicates(CHAVE_ATIVO).reset_index(drop=True)
+
+    originais = dados_originais[~_eh_linha_vazia(dados_originais)]
+    antes = soma_i(originais).rename("Soma I Antes")
+    depois = soma_i(fluxo_tratado).rename("Soma I Depois")
+    validacao = (validacao
+                 .merge(antes, left_on=CHAVE_ATIVO, right_index=True, how="left")
+                 .merge(depois, left_on=CHAVE_ATIVO, right_index=True, how="left"))
+    validacao[["Soma I Antes", "Soma I Depois"]] = validacao[["Soma I Antes", "Soma I Depois"]].fillna(0.0)
+    validacao["Diferença p/ 100"] = validacao["Soma I Depois"] - PERCENTUAL_TOTAL
+    validacao["Status"] = [STATUS_OK if abs(d) <= tolerancia else STATUS_ERRO
+                           for d in validacao["Diferença p/ 100"]]
+
+    qtd = len(validacao)
+    esperado = qtd * PERCENTUAL_TOTAL
+    encontrado = float(validacao["Soma I Depois"].sum())
+    tolerancia_total = qtd * tolerancia
+    consolidado = {
+        "Lastros validados": qtd,
+        "Soma esperada": esperado,
+        "Soma encontrada": encontrado,
+        "Diferença": encontrado - esperado,
+        "Tolerância usada": tolerancia_total,
+        "Status": STATUS_OK if abs(encontrado - esperado) <= tolerancia_total else STATUS_ERRO,
+        "Lastros com divergência": int((validacao["Status"] == STATUS_ERRO).sum()),
+    }
+    return validacao, consolidado
+
+
+# ---------------------------------------------------------------------------
 # Resumo
 # ---------------------------------------------------------------------------
 def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
+    """
+    Resumo do processamento em seções: {seção: {item: valor}}.
+    Usado no terminal e na aba Resumo do Excel.
+    """
     log = resultado.log_alteracoes
-    diag = resultado.diagnostico
 
-    def contar(tipo, col=None, evento=None, caso=None):
+    def contar(tipo, col=None, evento=None, caso=None, excluir_caso=None):
         m = log["Tipo de Alteração"] == tipo
         if col is not None:
             m &= log[col] == evento
         if caso is not None:
             m &= log["Caso"] == caso
+        if excluir_caso is not None:
+            m &= log["Caso"] != excluir_caso
         return int(m.sum())
 
-    def lastros(mascara) -> set:
-        return set(diag.loc[mascara, COL_LASTRO])
+    def lastros(df: pd.DataFrame) -> int:
+        return int(df[COL_LASTRO].nunique()) if len(df) else 0
 
-    regras = ~diag["Caso"].isin([LASTRO_SEM_EVENTO])
-    todos = lastros(pd.Series(True, index=diag.index))
-    com_pendencia = lastros(diag["Caso"] == PENDENCIA)
-    com_acao = lastros(diag["Ações"] != "nenhuma")
+    publicos = lastros(resultado.fluxo_titulos_publicos)
+    pendencia = lastros(resultado.pendencias)
+    validacao = resultado.validacao_consolidada
 
     return {
-        "Lastros com evento no intervalo": len(lastros(regras)),
-        "Grupos analisados (lastro x dia útil)": int(regras.sum()),
-        "Eventos I adicionados (regras)": (contar(TIPO_INCLUSAO, "Evento Final", EVENTO_I)
-                                           - contar(TIPO_INCLUSAO, "Evento Final", EVENTO_I, LASTRO_SEM_EVENTO)),
-        "Eventos L removidos": contar(TIPO_EXCLUSAO, "Evento Original", EVENTO_L),
-        "Eventos B removidos": contar(TIPO_EXCLUSAO, "Evento Original", EVENTO_B),
-        "Eventos J alterados": contar(TIPO_ALTERACAO, "Evento Original", EVENTO_J),
-        "Eventos com data levada para o dia útil": contar(TIPO_ALTERACAO_DATA),
-        "Lastros que receberam J + I (sem evento no dia útil)": len(lastros(diag["Caso"] == LASTRO_SEM_EVENTO)),
-        "Pares J + I incluídos": contar(TIPO_INCLUSAO, "Evento Final", EVENTO_J, LASTRO_SEM_EVENTO),
-        "Lastros sem necessidade de alteração": len(todos - com_acao - com_pendencia),
-        "Lastros com pendência (não tratados)": len(com_pendencia),
-        "Lastros com divergência no percentual de amortização": "Etapa 3",
+        "Lastros": {
+            "Lastros recebidos da query": resultado.lastros_recebidos,
+            "Linhas recebidas da query": resultado.linhas_recebidas,
+            "Títulos públicos": publicos,
+            "Títulos privados": resultado.lastros_recebidos - publicos,
+            "Compromissadas": lastros(resultado.fluxo_compromissadas),
+            "Fora da análise (tipo não configurado)": lastros(resultado.fluxo_fora_analise),
+            "Vencendo no intervalo": lastros(resultado.fluxo_vencendo),
+            "Em pendência": pendencia,
+            "Fluxo tratado (com alteração, vai para o TXT)": lastros(resultado.fluxo_tratado),
+            "Divergência de amortização (fora do TXT)": lastros(resultado.fluxo_divergencia),
+            "Fluxo sem alteração": lastros(resultado.fluxo_sem_alteracao),
+        },
+        "Eventos": {
+            "Eventos I incluídos": contar(TIPO_INCLUSAO, "Evento Final", EVENTO_I,
+                                          excluir_caso=LASTRO_SEM_EVENTO),
+            "Pares J + I incluídos (lastros sem evento)": contar(TIPO_INCLUSAO, "Evento Final", EVENTO_J,
+                                                                  caso=LASTRO_SEM_EVENTO),
+            "Eventos L retirados": contar(TIPO_EXCLUSAO, "Evento Original", EVENTO_L),
+            "Eventos B retirados": contar(TIPO_EXCLUSAO, "Evento Original", EVENTO_B),
+            "Eventos J alterados para o mínimo": contar(TIPO_ALTERACAO, "Evento Original", EVENTO_J),
+            "Datas levadas para o dia útil (fluxo tratado)": contar(TIPO_ALTERACAO_DATA),
+        },
+        "Validação de amortização": {
+            "Lastros validados": validacao.get("Lastros validados"),
+            "Lastros com divergência": validacao.get("Lastros com divergência"),
+            "Validação consolidada": validacao.get("Status"),
+        },
+        "Filtros": dict(resultado.filtros),
+        **_secoes_tipos(resultado.tipos_encontrados),
+    }
+
+
+def _secoes_tipos(tipos_encontrados: dict) -> dict:
+    """Seções do resumo com os tipos encontrados (só quando o filtro de tipos foi aplicado)."""
+    if not tipos_encontrados:
+        return {}
+    plural = lambda n: f"{n} lastro" + ("s" if n != 1 else "")
+    entraram = {tipo: f"pelo padrão '{padrao}' ({plural(qtd)})"
+                for tipo, (padrao, qtd) in tipos_encontrados["entraram"].items()}
+    fora = {tipo: plural(qtd) for tipo, qtd in tipos_encontrados["fora"].items()}
+    return {
+        "Tipos que entraram": entraram or {"(nenhum)": ""},
+        "Tipos fora da análise": fora or {"(nenhum)": ""},
     }
 
 
@@ -512,17 +865,44 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
 # ---------------------------------------------------------------------------
 def executar(df_query: pd.DataFrame, data_inicial, data_final,
              calendario: Calendario | None = None,
-             levar_para_dia_util: bool = True) -> ResultadoProcessamento:
-    """preparar -> processar -> resumo."""
+             levar_para_dia_util: bool = True,
+             tipos_ativo: list[str] | None = None,
+             excluir_compromissada: bool = True) -> ResultadoProcessamento:
+    """
+    preparar -> processar -> validar -> resumo.
+    tipos_ativo: lista dos tipos que ENTRAM na análise (None = sem filtro).
+    """
     dados = preparar_dados(df_query)
-    resultado = processar_eventos(dados, data_inicial, data_final, calendario, levar_para_dia_util)
+    resultado = processar_eventos(dados, data_inicial, data_final, calendario, levar_para_dia_util,
+                                  tipos_ativo, excluir_compromissada)
+    resultado.validacao_lastros, resultado.validacao_consolidada = validar_amortizacoes(
+        resultado.fluxo_tratado, dados, fluxo_sem_alteracao=resultado.fluxo_sem_alteracao)
+    _separar_divergencias(resultado)
     resultado.resumo = gerar_resumo(resultado)
     return resultado
 
 
-# ---------------------------------------------------------------------------
-# Etapa 3 (a implementar)
-# ---------------------------------------------------------------------------
-def validar_amortizacoes(fluxo_tratado: pd.DataFrame):
-    """Etapa 3: soma de I por lastro e validação consolidada."""
-    raise NotImplementedError("Etapa 3.")
+ABA_DIVERGENCIA = "Divergência de Amortização"
+
+
+def _separar_divergencias(resultado: ResultadoProcessamento) -> None:
+    """
+    R15. Lastros do Fluxo Tratado com soma de I diferente de 100 saem do Fluxo
+    Tratado (e portanto do TXT de upload) e vão para a aba Divergência de
+    Amortização, com o fluxo já tratado. Nada é ajustado.
+    Lastros do Fluxo Sem Alteração com divergência continuam onde estão.
+    """
+    v = resultado.validacao_lastros
+    erro = (v[COL_ABA] == "Fluxo Tratado") & (v["Status"] == STATUS_ERRO)
+    lastros_erro = set(v.loc[erro, COL_LASTRO])
+    if not lastros_erro:
+        return
+    v.loc[erro, COL_ABA] = ABA_DIVERGENCIA
+
+    fluxo = resultado.fluxo_tratado
+    mascara = fluxo[COL_LASTRO].isin(lastros_erro).to_numpy()
+    marcas = resultado.marcas_depois
+    resultado.fluxo_divergencia = fluxo[mascara].reset_index(drop=True)
+    resultado.marcas_divergencia = [m for m, d in zip(marcas, mascara) if d]
+    resultado.fluxo_tratado = fluxo[~mascara].reset_index(drop=True)
+    resultado.marcas_depois = [m for m, d in zip(marcas, mascara) if not d]
