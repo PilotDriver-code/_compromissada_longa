@@ -52,6 +52,8 @@ R8. Lastro sem codigo_clearing (sem cadastro) ou com codigo_clearing = 0.
 
 Títulos públicos, fora da análise e vencendo — o lastro INTEIRO fica fora do
 tratamento e do fluxo final, sem nenhuma alteração, e não recebe nem gera par J + I:
+R15. Lastro do Fluxo Tratado cuja soma de I não fecha 100: sai do Fluxo
+     Tratado e do TXT de upload e vai para a aba "Divergência de Amortização".
 R14. Título público: alguma posição na janela com indicador_publico_privado = 'U'
      (coluna titulo_publico = 'S' na query). Separado ANTES de qualquer outra
      regra (não cai em Fora da Análise, pendência ou vencendo) -> aba
@@ -204,6 +206,7 @@ class ResultadoProcessamento:
     diagnostico: pd.DataFrame
     pendencias: pd.DataFrame
     fluxo_sem_alteracao: pd.DataFrame = field(default_factory=pd.DataFrame)  # já vieram certos
+    fluxo_divergencia: pd.DataFrame = field(default_factory=pd.DataFrame)    # tratados com soma de I != 100
     fluxo_pendencias: pd.DataFrame = field(default_factory=pd.DataFrame)  # fluxo dos lastros em pendência
     fluxo_fora_analise: pd.DataFrame = field(default_factory=pd.DataFrame)  # tipo fora do filtro
     fluxo_compromissadas: pd.DataFrame = field(default_factory=pd.DataFrame)  # indicador_compromissada = S
@@ -220,6 +223,7 @@ class ResultadoProcessamento:
     marcas_antes: list = field(default_factory=list)
     marcas_depois: list = field(default_factory=list)
     marcas_sem_alteracao: list = field(default_factory=list)
+    marcas_divergencia: list = field(default_factory=list)
     lastros_recebidos: int = 0
     linhas_recebidas: int = 0
 
@@ -818,7 +822,8 @@ def gerar_resumo(resultado: ResultadoProcessamento) -> dict:
             "Fora da análise (tipo não configurado)": lastros(resultado.fluxo_fora_analise),
             "Vencendo no intervalo": lastros(resultado.fluxo_vencendo),
             "Em pendência": pendencia,
-            "Fluxo tratado (com alteração)": lastros(resultado.fluxo_tratado),
+            "Fluxo tratado (com alteração, vai para o TXT)": lastros(resultado.fluxo_tratado),
+            "Divergência de amortização (fora do TXT)": lastros(resultado.fluxo_divergencia),
             "Fluxo sem alteração": lastros(resultado.fluxo_sem_alteracao),
         },
         "Eventos": {
@@ -872,5 +877,32 @@ def executar(df_query: pd.DataFrame, data_inicial, data_final,
                                   tipos_ativo, excluir_compromissada)
     resultado.validacao_lastros, resultado.validacao_consolidada = validar_amortizacoes(
         resultado.fluxo_tratado, dados, fluxo_sem_alteracao=resultado.fluxo_sem_alteracao)
+    _separar_divergencias(resultado)
     resultado.resumo = gerar_resumo(resultado)
     return resultado
+
+
+ABA_DIVERGENCIA = "Divergência de Amortização"
+
+
+def _separar_divergencias(resultado: ResultadoProcessamento) -> None:
+    """
+    R15. Lastros do Fluxo Tratado com soma de I diferente de 100 saem do Fluxo
+    Tratado (e portanto do TXT de upload) e vão para a aba Divergência de
+    Amortização, com o fluxo já tratado. Nada é ajustado.
+    Lastros do Fluxo Sem Alteração com divergência continuam onde estão.
+    """
+    v = resultado.validacao_lastros
+    erro = (v[COL_ABA] == "Fluxo Tratado") & (v["Status"] == STATUS_ERRO)
+    lastros_erro = set(v.loc[erro, COL_LASTRO])
+    if not lastros_erro:
+        return
+    v.loc[erro, COL_ABA] = ABA_DIVERGENCIA
+
+    fluxo = resultado.fluxo_tratado
+    mascara = fluxo[COL_LASTRO].isin(lastros_erro).to_numpy()
+    marcas = resultado.marcas_depois
+    resultado.fluxo_divergencia = fluxo[mascara].reset_index(drop=True)
+    resultado.marcas_divergencia = [m for m, d in zip(marcas, mascara) if d]
+    resultado.fluxo_tratado = fluxo[~mascara].reset_index(drop=True)
+    resultado.marcas_depois = [m for m, d in zip(marcas, mascara) if not d]
