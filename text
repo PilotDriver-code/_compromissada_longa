@@ -1,119 +1,22 @@
-Passo 1: app/theme.py, 2 cores novas
+@echo off
+REM Gera dist\CentralRF.exe (um arquivo só, sem janela de console).
+REM Rode a partir da pasta do projeto:  build_exe.bat
 
-Dentro de _CONSOLE, logo abaixo da linha "con_link", acrescente:
+pip install --upgrade pyinstaller
 
-python
-    "con_table_border": "#24305C",  # borda das tabelas do console
-    "con_table_header": "#101A42",  # fundo do cabeçalho das tabelas
-Passo 2: app/worker.py, função files
+REM As exclusoes abaixo evitam erro quando ha mais de um Qt instalado (ex.: PyQt5 + PySide6).
+REM Se for empacotar com PyQt6 em vez de PySide6, troque por --exclude-module PySide6.
 
-Dentro de TaskContext, logo acima de def table(, acrescente:
+pyinstaller --noconfirm --clean --onefile --windowed ^
+  --name CentralRF ^
+  --icon assets\logo.ico ^
+  --add-data "assets;assets" ^
+  --exclude-module PyQt5 --exclude-module PyQt6 ^
+  --collect-data bizdays ^
+  main.py
 
-python
-    def files(self, caminhos, titulo: str = "Arquivos gerados") -> None:
-        """Quadro com os arquivos gerados (cada nome é um link que abre a pasta)."""
-        import json
-
-        dados = {"titulo": titulo, "caminhos": [str(c) for c in caminhos]}
-        self.log(json.dumps(dados, ensure_ascii=False), "files")
-Passo 3: app/widgets.py, classe LogConsole
-
-3a. Na função _cores, acrescente as duas cores no fim do dicionário. Ela fica assim:
-
-python
-            "value": t["con_value"], "link": t["con_link"],
-            "border": t["con_table_border"], "header_bg": t["con_table_header"],
-        }
-
-3b. Na função log, troque a linha do especiais por:
-
-python
-        especiais = {"section": self._secao, "file": self._arquivo, "table": self._tabela,
-                     "files": self._arquivos}
-
-3c. Apague a função _tabela inteira e cole no lugar estas três funções:
-
-python
-    def _nova_tabela(self, linhas: int, titulo: str, colunas=(62, 38)):
-        """Tabela com borda e cabeçalho (1ª linha, mesclada, com o título).
-        `colunas` = largura de cada coluna em % (chave, valor)."""
-        c = self._cores()
-        recuo = self._recuo()
-        cur = self._bloco(left=recuo)
-        tf = QtGui.QTextTableFormat()
-        tf.setBorder(1)
-        tf.setBorderStyle(QtGui.QTextFrameFormat.BorderStyle.BorderStyle_Solid)
-        tf.setBorderBrush(QtGui.QBrush(QtGui.QColor(c["border"])))
-        tf.setBorderCollapse(True)          # uma linha só entre as células
-        tf.setCellPadding(5)
-        tf.setCellSpacing(0)
-        tf.setLeftMargin(recuo)
-        tf.setTopMargin(10)                 # respiro entre uma tabela e a anterior
-        tf.setWidth(QtGui.QTextLength(QtGui.QTextLength.Type.PercentageLength, 100))
-        tf.setColumnWidthConstraints([
-            QtGui.QTextLength(QtGui.QTextLength.Type.PercentageLength, colunas[0]),
-            QtGui.QTextLength(QtGui.QTextLength.Type.PercentageLength, colunas[1]),
-        ])
-        tabela = cur.insertTable(linhas + 1, 2, tf)
-        tabela.mergeCells(0, 0, 1, 2)
-        cab = tabela.cellAt(0, 0)
-        fmt = cab.format()
-        fmt.setBackground(QtGui.QColor(c["header_bg"]))
-        cab.setFormat(fmt)
-        self._escrever(cab.firstCursorPosition(), titulo, c["title"], negrito=True)
-        return tabela
-
-    def _tabela(self, dados: str):
-        """Tabela chave/valor. `dados` = JSON {"titulo": str, "linhas": [[chave, valor], ...]}."""
-        import json
-
-        c = self._cores()
-        info = json.loads(dados)
-        linhas = info.get("linhas", [])
-        tabela = self._nova_tabela(len(linhas), info.get("titulo", ""))
-        for i, (chave, valor) in enumerate(linhas, start=1):
-            texto = str(valor)
-            cor_valor = {"ERRO": c["error"], "OK": c["ok"],
-                         "COM DIVERGÊNCIA": c["warn"]}.get(texto.strip().upper(), c["value"])
-            self._escrever(tabela.cellAt(i, 0).firstCursorPosition(), str(chave), c["key"])
-            self._escrever(tabela.cellAt(i, 1).firstCursorPosition(), texto, cor_valor)
-
-    def _arquivos(self, dados: str):
-        """Quadro dos arquivos gerados. `dados` = JSON {"titulo": str, "caminhos": [...]}.
-        Nome clicável (abre a pasta) à esquerda e a pasta à direita."""
-        import json
-
-        c = self._cores()
-        info = json.loads(dados)
-        caminhos = info.get("caminhos", [])
-        tabela = self._nova_tabela(len(caminhos), info.get("titulo", "Arquivos gerados"), colunas=(78, 22))
-        for i, caminho in enumerate(caminhos, start=1):
-            p = Path(caminho)
-            href = QtCore.QUrl.fromLocalFile(str(p)).toString()
-            self._escrever(tabela.cellAt(i, 0).firstCursorPosition(), p.name, c["link"], href=href)
-            self._escrever(tabela.cellAt(i, 1).firstCursorPosition(),
-                           f"{p.parent.parent.name}\\{p.parent.name}", c["muted"])
-        # linha em branco depois do quadro, para separar do que vem a seguir
-        self._bloco(top=4)
-Passo 4: tasks/eventos_sac/eventos_sac.py
-
-Na função _mostrar_resultado, troque o bloco dos arquivos:
-
-python
-    # antes
-    ctx.log("Arquivos gerados", "info")
-    ctx.file(saida["excel_antes"])
-    ctx.file(saida["excel_depois"])
-    if saida["uploads"]:
-        for caminho in saida["uploads"]:
-            ctx.file(caminho)
-    else:
-        ctx.log("TXT de upload não gerado (nenhum lastro no Fluxo Tratado)", "warn")
-
-por:
-
-python
-    # depois
-    ctx.files([saida["excel_antes"], saida["excel_depois"], *saida["uploads"]])
-    if not saida["uploads"]:
-        ctx.log("TXT de upload não gerado (nenhum lastro no Fluxo Tratado)", "warn")
+echo.
+echo Pronto: dist\CentralRF.exe
+echo Copie o .exe para a pasta onde ele vai ficar. A pasta setup (com Cravar PU,
+echo Eventos SAC, Config etc.) sera criada ao lado dele na primeira abertura.
+pause
