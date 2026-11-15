@@ -124,6 +124,34 @@ def formatar_resumo_terminal(resultado: tf.ResultadoProcessamento, info_execucao
     return "\n".join(saida)
 
 
+def formatar_alerta_divergencias(resultado: tf.ResultadoProcessamento) -> str:
+    """Aviso em destaque para o terminal quando há divergência na soma de I. Vazio se não houver."""
+    v = resultado.validacao_lastros
+    if v.empty:
+        return ""
+    erros = v[v["Status"] == tf.STATUS_ERRO]
+    if erros.empty:
+        return ""
+    fora_txt = erros[erros[tf.COL_ABA] == tf.ABA_DIVERGENCIA]
+    sem_alt = erros[erros[tf.COL_ABA] == "Fluxo Sem Alteração"]
+
+    def linha(r):
+        return (f"    lastro {r[tf.COL_LASTRO]} | ativo {r[tf.COL_ATIVO]} | "
+                f"soma de I = {np.format_float_positional(float(r['Soma I Depois']), trim='-')}")
+
+    saida = ["", "!" * 60, "ATENÇÃO: DIVERGÊNCIA NA SOMA DAS AMORTIZAÇÕES (I)", "!" * 60]
+    if len(fora_txt):
+        saida.append(f"{len(fora_txt)} lastro(s) RETIRADO(S) DO TXT "
+                     f"(ver aba '{tf.ABA_DIVERGENCIA}' no Excel DEPOIS):")
+        saida += [linha(r) for _, r in fora_txt.iterrows()]
+    if len(sem_alt):
+        saida.append(f"{len(sem_alt)} lastro(s) sem alteração já vêm com divergência da origem "
+                     "(não sobem de qualquer forma):")
+        saida += [linha(r) for _, r in sem_alt.iterrows()]
+    saida.append("!" * 60)
+    return "\n".join(saida)
+
+
 def gerar_excels(
     df_query: pd.DataFrame,
     data_inicial,
@@ -167,7 +195,8 @@ def gerar_excels(
         ("Azul", "Fluxo Tratado: data levada para o dia útil (data cadastrada em data_evento_original). "
                  "Fluxo Sem Alteração: data em fim de semana/feriado, mantida (dia útil em "
                  "data_evento_ajustada, só para consulta)"),
-        ("Vermelho", "ANTES: linha que será excluída (L ou B). Aba Validações: divergência na soma de I"),
+        ("Vermelho", "ANTES: linha que será excluída (L ou B). Aba Validações: divergência na soma de I "
+                     f"(se o lastro era do Fluxo Tratado, ele está na aba {tf.ABA_DIVERGENCIA} e fora do TXT)"),
         ("Cinza", "ANTES: lastro em pendência (abas Pendências e Fluxo Pendências)"),
         ("Rosa", "ANTES: compromissada (aba Compromissadas)"),
         ("Lilás", "ANTES: tipo de ativo não configurado (aba Fora da Análise)"),
@@ -191,6 +220,8 @@ def gerar_excels(
                       [cores.get(m) for m in resultado.marcas_depois])
         _escrever_aba(excel, resultado.fluxo_sem_alteracao, "Fluxo Sem Alteração",
                       [cores.get(m) for m in resultado.marcas_sem_alteracao])
+        _escrever_aba(excel, resultado.fluxo_divergencia, tf.ABA_DIVERGENCIA,
+                      [cores.get(m) for m in resultado.marcas_divergencia])
         _escrever_validacoes(excel, resultado.validacao_consolidada, resultado.validacao_lastros,
                              cores[tf.MARCA_INCLUIDA], cores[tf.MARCA_EXCLUIDA])
         _escrever_aba(excel, resultado.pendencias, "Pendências")
