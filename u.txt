@@ -1,0 +1,63 @@
+import contextlib
+import io
+import os
+from pathlib import Path
+
+import pandas as pd
+
+import config
+from app.worker import Falha
+from core import configuracoes as cfg
+
+
+
+# ============================================================================
+# SUA LÓGICA (de_para_lastros.py)
+# ============================================================================
+filtro_colunas_posicao = ['CD_SISTEMA', 'CD_LASTRO', 'CD_CETIP_SELIC', 'RFTP_CD']
+
+# ANTES: pasta_arquivos_VCRAS = fr'C:\Users\midoubr\OneDrive - Banco Itaú SA\Documentos\Arquivos_Conciliacao\SAC'
+# AGORA: a pasta SAC dentro do setup da Central
+pasta_arquivos_VCRAS = str(cfg.pasta_raiz() / config.PASTA_SAC)
+nome_arquivo_posicao = 'VCRAPRF.txt'
+
+lista_de_excecoes = ['CRIVP', 'DEBVP', 'CRAVP', 'CRAOP', 'LFVP', 'LFCOM', 'DBIOP', 'DEBLA', 'CRILA', 'TERMO']
+
+
+def de_para_lastro_POSICAO_PRIVADOS():
+
+    dfs = []
+
+    for pasta in ['LZ', 'XZ', 'BN7']:
+
+        caminho_pasta = os.path.join(pasta_arquivos_VCRAS, pasta)
+        if not os.path.isdir(caminho_pasta):
+            print(f"Pasta {caminho_pasta} não encontrada.")
+            continue  # pula para a próxima pasta
+
+        arquivo_posicao = os.path.join(caminho_pasta, nome_arquivo_posicao)
+        if os.path.exists(arquivo_posicao):
+            df = pd.read_csv(arquivo_posicao, sep=';', encoding='latin-1')
+            df = df[df['IC_PUB_PRIV'] == 'I']
+            df = df[~df['RFTP_CD'].isin(lista_de_excecoes)]
+            df = df[filtro_colunas_posicao]
+            dfs.append(df)
+        else:
+            print(f"Arquivo POSICAO não encontrado em {caminho_pasta}")
+
+    if dfs:
+        df_concat = pd.concat(dfs, ignore_index=True)
+        df_concat = df_concat.drop_duplicates(subset=['CD_LASTRO'])
+
+        df_concat = df_concat.rename(columns={'CD_CETIP_SELIC': 'ATIVO'})
+
+        return df_concat
+    else:
+        print("Nenhum arquivo POSICAO encontrado.")
+        return None
+
+
+def consolidar(arquivos: dict[str, Path], destino: Path):
+    """Chamada pelo botão "Gerar de-para". Devolve o DataFrame; a Central grava em `destino`."""
+    return de_para_lastro_POSICAO_PRIVADOS()
+
