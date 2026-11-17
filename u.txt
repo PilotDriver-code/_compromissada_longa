@@ -1,63 +1,119 @@
-import contextlib
-import io
-import os
-from pathlib import Path
+# Exportar carteiras (Cravar PU)
 
-import pandas as pd
+Quando o interruptor **Exportar carteiras** estiver ligado, o Cravar PU gera, para cada base
+processada, um `carteiras_<BASE>.txt` com as carteiras da **coluna A** dos arquivos da base.
 
-import config
-from app.worker import Falha
-from core import configuracoes as cfg
+```
+Cravar PU\
+  LZ\
+    AJUSTE_LZ_parte_1.csv
+    AJUSTE_LZ_parte_2.csv
+    carteiras_LZ.txt        ← uma carteira por linha, sem repetir, em ordem
+  XZ\
+    AJUSTE_XZ_parte_1.csv
+    carteiras_XZ.txt
+```
 
+## A ideia
 
+As carteiras são lidas do **arquivo geral** (`arquivo_final_ajuste`), **antes** de ele ser
+quebrado em partes de 4.000 linhas. Assim:
 
-# ============================================================================
-# SUA LÓGICA (de_para_lastros.py)
-# ============================================================================
-filtro_colunas_posicao = ['CD_SISTEMA', 'CD_LASTRO', 'CD_CETIP_SELIC', 'RFTP_CD']
+- não é preciso reler os CSVs gerados;
+- uma carteira espalhada em duas partes aparece uma vez só;
+- a lista sai exatamente do mesmo dado que foi gravado.
 
-# ANTES: pasta_arquivos_VCRAS = fr'C:\Users\midoubr\OneDrive - Banco Itaú SA\Documentos\Arquivos_Conciliacao\SAC'
-# AGORA: a pasta SAC dentro do setup da Central
-pasta_arquivos_VCRAS = str(cfg.pasta_raiz() / config.PASTA_SAC)
-nome_arquivo_posicao = 'VCRAPRF.txt'
+O TXT é sobrescrito a cada execução, como os CSVs. Com o interruptor desligado, nada é gerado.
 
-lista_de_excecoes = ['CRIVP', 'DEBVP', 'CRAVP', 'CRAOP', 'LFVP', 'LFCOM', 'DBIOP', 'DEBLA', 'CRILA', 'TERMO']
+---
 
+Todas as mudanças são em `tasks/cravar_pu/cravar_pu.py`, na função `executar`.
 
-def de_para_lastro_POSICAO_PRIVADOS():
+## Passo 1: Lista de controle, antes do `for`
 
-    dfs = []
+Logo antes de `for i, base in enumerate(bases, start=1):`:
 
-    for pasta in ['LZ', 'XZ', 'BN7']:
+```python
+    carteiras_exportadas = []   # (base, quantidade, caminho do txt), para o resumo no fim
+```
 
-        caminho_pasta = os.path.join(pasta_arquivos_VCRAS, pasta)
-        if not os.path.isdir(caminho_pasta):
-            print(f"Pasta {caminho_pasta} não encontrada.")
-            continue  # pula para a próxima pasta
+## Passo 2: Gerar o TXT de cada base, dentro do `for`
 
-        arquivo_posicao = os.path.join(caminho_pasta, nome_arquivo_posicao)
-        if os.path.exists(arquivo_posicao):
-            df = pd.read_csv(arquivo_posicao, sep=';', encoding='latin-1')
-            df = df[df['IC_PUB_PRIV'] == 'I']
-            df = df[~df['RFTP_CD'].isin(lista_de_excecoes)]
-            df = df[filtro_colunas_posicao]
-            dfs.append(df)
-        else:
-            print(f"Arquivo POSICAO não encontrado em {caminho_pasta}")
+Entre o `mkdir` da pasta da base e o `salvar_e_dividir`:
 
-    if dfs:
-        df_concat = pd.concat(dfs, ignore_index=True)
-        df_concat = df_concat.drop_duplicates(subset=['CD_LASTRO'])
+```python
+            pasta_saida = saida / base
+            pasta_saida.mkdir(parents=True, exist_ok=True)
 
-        df_concat = df_concat.rename(columns={'CD_CETIP_SELIC': 'ATIVO'})
+            # Exportar carteiras: pega a coluna A do arquivo geral, ANTES de quebrar em partes
+            if params["exportar_carteiras"]:
+                carteiras = (arquivo_final_ajuste.iloc[:, 0]
+                             .dropna().astype(str).str.strip())
+                carteiras = sorted(c for c in carteiras.unique() if c)
 
-        return df_concat
-    else:
-        print("Nenhum arquivo POSICAO encontrado.")
-        return None
+                caminho_txt = pasta_saida / f"carteiras_{base}.txt"
+                caminho_txt.write_text("\n".join(carteiras) + "\n", encoding="utf-8")
+                carteiras_exportadas.append((base, len(carteiras), caminho_txt))
 
+                if carteiras:
+                    ctx.log(f"{base}: {len(carteiras)} carteira(s) exportada(s)", "ok")
+                else:
+                    ctx.log(f"{base}: nenhuma carteira na coluna A, o TXT ficou vazio", "warn")
 
-def consolidar(arquivos: dict[str, Path], destino: Path):
-    """Chamada pelo botão "Gerar de-para". Devolve o DataFrame; a Central grava em `destino`."""
-    return de_para_lastro_POSICAO_PRIVADOS()
+            salvar_e_dividir(arquivo_final_ajuste, str(pasta_saida), prefixo=f"AJUSTE_{base}_parte")
+```
 
+## Passo 3: Resumo no console, depois do `for`
+
+Depois que o `for` termina e antes do `return` (indentação do `for`, não de dentro dele):
+
+```python
+    if carteiras_exportadas:
+        ctx.table("Carteiras exportadas",
+                  [(base, f"{qtd} carteira(s)") for base, qtd, _ in carteiras_exportadas])
+        ctx.files([caminho for _, _, caminho in carteiras_exportadas], "Listas de carteiras")
+```
+
+> Usa `ctx.table` e `ctx.files`, do console novo (o mesmo do Eventos SAC).
+
+## Passo 4: Mensagem final
+
+Troque o `return` do fim do `executar` por:
+
+```python
+    msg = f"PU cravado para {processadas} de {len(bases)} base(s)."
+    if carteiras_exportadas:
+        msg += f" Carteiras exportadas: {len(carteiras_exportadas)} arquivo(s)."
+    return msg
+```
+
+## Opcional: explicar o interruptor na tela
+
+Em `app/pages/cravar_pu.py`, troque:
+
+```python
+        self.sw_carteiras = SwitchRow("Exportar carteiras")
+```
+
+por:
+
+```python
+        self.sw_carteiras = SwitchRow("Exportar carteiras",
+                                      "Gera um carteiras_<BASE>.txt com as carteiras da coluna A.")
+```
+
+---
+
+## Confira antes de testar
+
+Abra um CSV gerado e veja se a **coluna A** tem mesmo as carteiras. Se o TXT vier com números
+como 0, 1, 2… ou outra informação, o `salvar_e_dividir` está gravando o índice ou mudando a
+ordem das colunas. Nesse caso, troque `.iloc[:, 0]` pelo nome da coluna, por exemplo
+`arquivo_final_ajuste["CARTEIRA"]`.
+
+## Teste
+
+1. No Cravar PU, marque **LZ** e **XZ** e ligue **Exportar carteiras**.
+2. Processe.
+3. Confira `Cravar PU\LZ\carteiras_LZ.txt` e `Cravar PU\XZ\carteiras_XZ.txt`.
+4. No fim do console aparecem a tabela **Carteiras exportadas** e os links para os TXT.
