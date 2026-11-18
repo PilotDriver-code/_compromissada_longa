@@ -20,3 +20,18 @@ echo Pronto: dist\CentralRF.exe
 echo Copie o .exe para a pasta onde ele vai ficar. A pasta setup (com Cravar PU,
 echo Eventos SAC, Config etc.) sera criada ao lado dele na primeira abertura.
 pause
+
+
+
+
+
+
+
+python -m PyInstaller --noconfirm --clean --onefile --windowed ^
+  --name CentralRF ^
+  --icon assets\logo.ico ^
+  --add-data "assets;assets" ^
+  --exclude-module PyQt5 --exclude-module PyQt6 ^
+  --exclude-module pkg_resources ^
+  --collect-data bizdays ^
+  main.py
