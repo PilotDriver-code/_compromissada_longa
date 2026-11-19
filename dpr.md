@@ -1,276 +1,277 @@
-# Prêmio: vigiar a pasta CETIP (versões novas dos arquivos de operações)
+# Prêmio: lista de versões dos arquivos com o visual da Central
 
-Enquanto a tela **Prêmio** está aberta, a Central confere a pasta `setup\Arquivos Conciliacao\CETIP`
-**a cada 4 segundos**, igual ao Cravar PU com o de-para.
+A lista que abre ao clicar no arquivo do LZ/XZ passa a ter:
 
-- **Versão nova:** entra na lista com a marca "mais recente". A versão marcada **não muda sozinha**,
-  continua a que você escolheu (por padrão, a 1ª do dia). Embaixo dos arquivos aparece, em laranja:
-  `XZ: nova versão às 13:38, não selecionada.`
-- **Arquivo marcado sumiu** (apagado ou renomeado): a lista volta para a 1ª do dia e aparece, em vermelho:
-  `LZ: a versão marcada saiu da pasta (Operacoes_19112026_0742.txt). Confira a escolha.`
-- O aviso some quando você escolhe uma versão na lista daquela base.
-- Com a lista aberta, a Central não mexe nela: confere de novo no ciclo seguinte.
-- A conferência para quando você sai da tela e enquanto o MTCAIXA está sendo gerado.
+- **abre embaixo da caixa**, sem cobrir a caixa, e sem as faixas pretas nem a moldura do Windows;
+- **cantos arredondados**, fundo e borda nas cores do tema (claro e escuro);
+- cada versão em colunas alinhadas: **hora | etiqueta | nome do arquivo**;
+- etiqueta **"1ª do dia"** em laranja e **"mais recente"** em cinza;
+- a versão marcada em **negrito com ✓**, e destaque suave ao passar o mouse;
+- largura do tamanho do maior nome (nome muito grande é cortado no meio com "...").
 
-Todas as mudanças são em **`app\pages\premio.py`**.
+Mudam 2 arquivos: `tasks\premio\versoes.py` e `app\pages\premio.py`.
 
 ---
 
-## Passo 1: import do QtCore
+## Passo 1: `tasks\premio\versoes.py`
 
-No topo do arquivo, troque:
-
-```python
-from ..qt import QtGui, QtWidgets, Qt, Signal
-```
-
-por:
+Troque a função `rotulo` inteira (é a última do arquivo) por estas duas.
+A nova `partes` devolve hora, etiqueta e nome separados, para a lista desenhar cada um com seu estilo:
 
 ```python
-from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
-```
+def partes(versoes: list[tuple[Path, datetime]], i: int, hoje: date | None = None) -> tuple[str, str, str]:
+    """(hora, marca, nome) de um item da lista. Hora vira "dd/mm hh:mm" quando não é de hoje."""
+    hoje = hoje or date.today()
+    caminho, quando = versoes[i]
+    de_hoje = [j for j, (_, q) in enumerate(versoes) if q.date() == hoje]
+    quando_txt = quando.strftime("%H:%M") if quando.date() == hoje else quando.strftime("%d/%m %H:%M")
+    marca = ""
+    if de_hoje and i == de_hoje[0]:
+        marca = "1ª do dia"
+    elif i == len(versoes) - 1 and len(versoes) > 1:
+        marca = "mais recente"
+    return quando_txt, marca, caminho.name
 
----
 
-## Passo 2: texto padrão e intervalo
-
-Logo abaixo dos imports, antes de `# Ícone do menu`, acrescente:
-
-```python
-HINT_ARQUIVOS = ("Padrão: a 1ª versão do dia. Os dois juntos formam a lista de "
-                 "títulos do dia, que vale para LZ, XZ e BN7.")
-INTERVALO_VIGIA_MS = 4000   # de quanto em quanto tempo a tela confere a pasta CETIP
+def rotulo(versoes: list[tuple[Path, datetime]], i: int, hoje: date | None = None) -> str:
+    """Texto do item (aparece na caixa fechada): hora, marca e nome do arquivo."""
+    return "   ".join(x for x in partes(versoes, i, hoje) if x)
 ```
 
 ---
 
-## Passo 3: classe `SeletorArquivo`
+## Passo 2: `app\pages\premio.py`, a lista nova
 
-### 3a. Memória dos arquivos que já estavam na pasta
-
-No `__init__`, troque:
-
-```python
-        self._extra: Path | None = None   # arquivo escolhido fora da pasta CETIP
-        self.restyle()
-```
-
-por:
+Cole este bloco **logo antes** da linha `class SeletorArquivo(W.QWidget):`.
+Ele cria a `ComboVersoes` (a caixa) e o `_VersaoDelegate` (quem desenha cada linha da lista):
 
 ```python
-        self._extra: Path | None = None   # arquivo escolhido fora da pasta CETIP
-        self._conhecidos: set | None = None   # arquivos que já estavam na pasta (para achar versão nova)
-        self.restyle()
+PARTES_ROLE = Qt.ItemDataRole.UserRole + 1   # (hora, marca, nome) de cada versão, para desenhar a lista
+
+
+class _VersaoDelegate(W.QStyledItemDelegate):
+    """Desenha cada versão da lista: hora | etiqueta (1ª do dia / mais recente) | nome do arquivo | ✓."""
+
+    ALTURA = 34
+
+    def __init__(self, combo: W.QComboBox):
+        super().__init__(combo)
+        self.combo = combo
+
+    def _partes(self, index):
+        partes = index.data(PARTES_ROLE)
+        return partes if partes else ("", "", index.data(Qt.ItemDataRole.DisplayRole) or "")
+
+    def _largura_hora(self, fm) -> int:
+        horas = [self._partes(self.combo.model().index(r, 0))[0] for r in range(self.combo.count())]
+        return max([fm.horizontalAdvance(h) for h in horas if h] or [0])
+
+    def _largura_etiqueta(self, fonte: QtGui.QFont) -> int:
+        """Espaço reservado para a etiqueta, igual em todas as linhas (os nomes ficam alinhados)."""
+        fme = QtGui.QFontMetrics(self._fonte_etiqueta(fonte))
+        marcas = [self._partes(self.combo.model().index(r, 0))[1] for r in range(self.combo.count())]
+        larguras = [fme.horizontalAdvance(m) + 14 for m in marcas if m]
+        return max(larguras) + 10 if larguras else 0
+
+    @staticmethod
+    def _fonte_etiqueta(base: QtGui.QFont) -> QtGui.QFont:
+        f = QtGui.QFont(base)
+        f.setPointSizeF(max(7.0, base.pointSizeF() - 1.5))
+        f.setBold(True)
+        return f
+
+    def sizeHint(self, option, index):  # noqa: N802 - API Qt
+        hora, marca, nome = self._partes(index)
+        fm = option.fontMetrics
+        w = 12 + self._largura_hora(fm) + 12 + self._largura_etiqueta(option.font)
+        w += fm.horizontalAdvance(nome) + 12 + 16 + 12
+        return QtCore.QSize(w, self.ALTURA)
+
+    def paint(self, painter, option, index):
+        t = theme.current()
+        hora, marca, nome = self._partes(index)
+        r = option.rect.adjusted(4, 2, -4, -2)
+        ativo = bool(option.state & (W.QStyle.StateFlag.State_MouseOver | W.QStyle.StateFlag.State_Selected))
+        marcado = index.row() == self.combo.currentIndex()
+
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if ativo:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QtGui.QColor(t["hover"]))
+            painter.drawRoundedRect(QtCore.QRectF(r), 6, 6)
+
+        fm = option.fontMetrics
+        x = r.left() + 10
+        meio = r.center().y()
+        alto = fm.height()
+
+        # hora
+        painter.setFont(option.font)
+        painter.setPen(QtGui.QColor(t["ink_muted"]))
+        larg_hora = self._largura_hora(fm)
+        if hora:
+            painter.drawText(QtCore.QRect(x, meio - alto // 2, larg_hora, alto),
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), hora)
+            x += larg_hora + 12
+
+        # etiqueta (o espaço é reservado mesmo sem etiqueta, para alinhar os nomes)
+        x_nome = x + self._largura_etiqueta(option.font)
+        if marca:
+            fe = self._fonte_etiqueta(option.font)
+            fme = QtGui.QFontMetrics(fe)
+            pill = QtCore.QRectF(x, meio - 9, fme.horizontalAdvance(marca) + 14, 18)
+            if marca == "1ª do dia":
+                fundo, cor, borda = t["accent_soft"], t["accent_text"], t["accent_soft"]
+            else:
+                fundo, cor, borda = t["field"], t["ink_muted"], t["border"]
+            painter.setPen(QtGui.QPen(QtGui.QColor(borda), 1))
+            painter.setBrush(QtGui.QColor(fundo))
+            painter.drawRoundedRect(pill, 9, 9)
+            painter.setFont(fe)
+            painter.setPen(QtGui.QColor(cor))
+            painter.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), marca)
+        x = x_nome
+
+        # nome do arquivo (corta com "..." se faltar espaço) e ✓ na versão marcada
+        painter.setFont(option.font)
+        fim = r.right() - 12 - (16 if marcado else 0)
+        texto = fm.elidedText(nome, Qt.TextElideMode.ElideMiddle, max(0, fim - x))
+        painter.setPen(QtGui.QColor(t["ink"]))
+        f = QtGui.QFont(option.font)
+        f.setBold(marcado)
+        painter.setFont(f)
+        painter.drawText(QtCore.QRect(x, meio - alto // 2, max(0, fim - x), alto),
+                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), texto)
+        if marcado:
+            painter.setPen(QtGui.QColor(t["accent"]))
+            painter.drawText(QtCore.QRect(r.right() - 24, meio - alto // 2, 16, alto),
+                             int(Qt.AlignmentFlag.AlignCenter), "✓")
+        painter.restore()
+
+
+class ComboVersoes(W.QComboBox):
+    """Lista de versões com o visual da Central: abre embaixo da caixa, cantos arredondados, sem moldura do Windows."""
+
+    def __init__(self):
+        super().__init__()
+        lista = W.QListView()
+        lista.setUniformItemSizes(True)
+        lista.setMouseTracking(True)
+        lista.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setView(lista)
+        lista.setItemDelegate(_VersaoDelegate(self))
+        self.setMaxVisibleItems(8)
+        janela = lista.window()   # a "caixinha" que segura a lista aberta
+        janela.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+                              | Qt.WindowType.NoDropShadowWindowHint)
+        janela.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def showPopup(self):  # noqa: N802 - API Qt
+        # a lista aberta fica do tamanho do maior item (no mínimo, da largura da caixa)
+        opcao = W.QStyleOptionViewItem()
+        opcao.initFrom(self.view())
+        delegate = self.view().itemDelegate()
+        maior = max((delegate.sizeHint(opcao, self.model().index(r, 0)).width()
+                     for r in range(self.count())), default=0)
+        tela = self.screen().availableGeometry().width() if self.screen() else 1600
+        self.view().setMinimumWidth(min(max(self.width(), maior + 16), tela - 40))
+        super().showPopup()
+
 ```
 
-### 3b. `recarregar` passa a dizer o que mudou
-
-Troque o começo do método, de `def recarregar(self):` até `self.combo.blockSignals(True)`:
-
-```python
-    def recarregar(self):
-        from tasks.premio import versoes as V
-
-        atual = self.caminho()
-        versoes = V.listar_versoes(self._pasta_fn(), self.base)
-        self.combo.blockSignals(True)
-```
-
-por:
-
-```python
-    def recarregar(self) -> dict:
-        """Relista as versões sem trocar a escolhida.
-
-        Devolve {"novas": [(caminho, quando)], "sumiu": nome ou None}:
-        novas = versões que apareceram desde a última conferência;
-        sumiu = a versão marcada não existe mais (a lista volta para a 1ª do dia).
-        """
-        from tasks.premio import versoes as V
-
-        atual = self.caminho()
-        versoes = V.listar_versoes(self._pasta_fn(), self.base)
-        caminhos = {str(p) for p, _ in versoes}
-        anteriores = self._conhecidos
-        sumiu = Path(atual).name if atual and not Path(atual).is_file() else None
-        if anteriores is not None and caminhos == anteriores and not sumiu:
-            return {"novas": [], "sumiu": None}          # nada mudou na pasta
-        if self.combo.view().isVisible():
-            return {"novas": [], "sumiu": None}          # lista aberta: não mexe agora, confere no próximo ciclo
-        self._conhecidos = caminhos
-        novas = [] if anteriores is None else [(p, q) for p, q in versoes if str(p) not in anteriores]
-
-        self.combo.blockSignals(True)
-```
-
-> Quando a pasta não mudou, o método sai logo no começo e não remonta a lista.
-> Por isso a conferência a cada 4 s não pisca a tela nem perde a sua escolha.
-
-### 3c. Fim do `recarregar`
-
-No fim do método, depois de `self._tooltip()`, acrescente o `return`:
-
-```python
-        self.combo.setCurrentIndex(max(i, 0))
-        self.combo.blockSignals(False)
-        self._tooltip()
-        return {"novas": novas, "sumiu": sumiu}
-```
-
-### 3d. Botão de pasta (escolher outro arquivo)
-
-No método `_escolher`, troque:
-
-```python
-        self._extra = Path(caminho)
-        self.recarregar()
-```
-
-por:
-
-```python
-        self._extra = Path(caminho)
-        self._conhecidos = None   # força montar a lista de novo, já com o arquivo escolhido
-        self.recarregar()
-```
-
-Sem essa linha, o arquivo escolhido fora da pasta não entraria na lista, porque o conteúdo da pasta não mudou.
+> Confira se o import do topo tem o `QtCore` (ele entrou no passo a passo da vigia da pasta):
+> `from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal`
 
 ---
 
-## Passo 4: classe `PremioPage`, no `__init__`
-
-### 4a. Guardar os avisos
-
-Logo depois de `self._tarefa = ""`:
-
-```python
-        self._avisos: dict[str, tuple[str, str]] = {}   # base -> (texto, tom) do aviso dos arquivos
-```
-
-### 4b. O relógio
-
-Logo depois de `self._limpar_resultado()` (última linha do `__init__`):
-
-```python
-        # Enquanto a tela está aberta, confere a pasta CETIP a cada 4 s (versão nova, arquivo que sumiu)
-        self._relogio = QtCore.QTimer(self)
-        self._relogio.setInterval(INTERVALO_VIGIA_MS)
-        self._relogio.timeout.connect(self._vigiar_arquivos)
-```
-
----
-
-## Passo 5: `_painel_parametros`
+## Passo 3: `SeletorArquivo.__init__`, usar a lista nova
 
 Troque:
 
 ```python
-        self.f_arquivos = Field("Arquivos de operações CETIP", caixa,
-                                "Padrão: a 1ª versão do dia. Os dois juntos formam a lista de "
-                                "títulos do dia, que vale para LZ, XZ e BN7.")
+        self.combo = W.QComboBox()
+        self.combo.setMinimumWidth(120)
+        self.combo.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo.view().setTextElideMode(Qt.TextElideMode.ElideNone)
 ```
 
 por:
 
 ```python
-        for base, s in self.seletores.items():
-            s.combo.activated.connect(lambda _, b=base: self._limpar_aviso(b))   # o usuário escolheu
-        self.f_arquivos = Field("Arquivos de operações CETIP", caixa, HINT_ARQUIVOS)
-```
-
-> O `activated` só dispara quando **você** escolhe na lista; a atualização automática não dispara.
-> Assim o aviso some só quando você mesmo olhou e escolheu.
-
----
-
-## Passo 6: ligar e desligar a conferência + os métodos novos
-
-Troque o `on_shown` inteiro:
-
-```python
-    def on_shown(self):
-        super().on_shown()
-        for s in self.seletores.values():
-            s.recarregar()
-        self._status_aws()
-```
-
-por:
-
-```python
-    def on_shown(self):
-        super().on_shown()
-        self._vigiar_arquivos()
-        self._relogio.start()
-        self._status_aws()
-
-    def hideEvent(self, event):  # noqa: N802 - para de conferir quando sai da tela
-        self._relogio.stop()
-        super().hideEvent(event)
-
-    # Vigia da pasta CETIP -------------------------------------------------------
-    def _vigiar_arquivos(self):
-        if self.is_busy():
-            return
-        for base, s in self.seletores.items():
-            r = s.recarregar()
-            if r["sumiu"]:
-                self._avisos[base] = (f"{base}: a versão marcada saiu da pasta ({r['sumiu']}). "
-                                      f"Confira a escolha.", "error")
-            elif r["novas"]:
-                p, quando = r["novas"][-1]
-                self._avisos[base] = (f"{base}: nova versão às {quando:%H:%M}, não selecionada.", "warn")
-        self._mostrar_avisos()
-
-    def _limpar_aviso(self, base: str):
-        self._avisos.pop(base, None)
-        self._mostrar_avisos()
-
-    def _mostrar_avisos(self):
-        if not self._avisos:
-            self.f_arquivos.set_hint(HINT_ARQUIVOS)
-            return
-        tom = "error" if any(t == "error" for _, t in self._avisos.values()) else "warn"
-        self.f_arquivos.set_hint("\n".join(txt for txt, _ in self._avisos.values()), tom)
+        self.combo = ComboVersoes()
+        self.combo.setMinimumWidth(120)
+        self.combo.setSizeAdjustPolicy(W.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
 ```
 
 ---
 
-## Passo 7: `run()`
+## Passo 4: `SeletorArquivo.recarregar`, mandar as partes de cada versão
 
-No `run`, troque:
+Troque:
 
 ```python
-            self.toast(f"Arquivo de operações não encontrado: {', '.join(faltando)}. Escolha de novo.", "error")
-            for s in self.seletores.values():
-                s.recarregar()
-            return
-        self.f_arquivos.set_hint("Padrão: a 1ª versão do dia. Os dois juntos formam a lista de "
-                                 "títulos do dia, que vale para LZ, XZ e BN7.")
+        for i, (p, _) in enumerate(versoes):
+            self.combo.addItem(V.rotulo(versoes, i), str(p))
+        if self._extra and self._extra.is_file() and self.combo.findData(str(self._extra)) < 0:
+            quando = datetime.fromtimestamp(self._extra.stat().st_mtime).strftime("%d/%m %H:%M")
+            self.combo.addItem(f"{quando}   escolhido   {self._extra.name}", str(self._extra))
 ```
 
 por:
 
 ```python
-            self.toast(f"Arquivo de operações não encontrado: {', '.join(faltando)}. Escolha de novo.", "error")
-            self._vigiar_arquivos()
-            return
-        self._mostrar_avisos()
+        for i, (p, _) in enumerate(versoes):
+            self.combo.addItem(V.rotulo(versoes, i), str(p))
+            self.combo.setItemData(self.combo.count() - 1, V.partes(versoes, i), PARTES_ROLE)
+        if self._extra and self._extra.is_file() and self.combo.findData(str(self._extra)) < 0:
+            quando = datetime.fromtimestamp(self._extra.stat().st_mtime).strftime("%d/%m %H:%M")
+            self.combo.addItem(f"{quando}   escolhido   {self._extra.name}", str(self._extra))
+            self.combo.setItemData(self.combo.count() - 1, (quando, "escolhido", self._extra.name), PARTES_ROLE)
 ```
 
-Assim, clicar em **Gerar MTCAIXA** não apaga um aviso de versão nova que ainda está valendo.
+(A caixa fechada continua mostrando o texto do `rotulo`; a lista aberta usa as partes.)
+
+---
+
+## Passo 5: `SeletorArquivo.restyle`, cores da caixa e da lista
+
+Troque o método `restyle` da classe `SeletorArquivo` inteiro por:
+
+```python
+    def restyle(self):
+        t = theme.current()
+        self.tag.setStyleSheet(f"background:{t['field']}; border:1px solid {t['border']}; border-radius:6px;"
+                               f"padding:6px 0; font-weight:600; color:{t['ink_muted']}; font-size:12px;")
+        self.combo.setStyleSheet(f"""
+            QComboBox {{ background: {t['field']}; border: 1px solid {t['border']}; border-radius: 8px;
+                         padding: 6px 10px; color: {t['ink']}; font-size: 12px; min-height: 22px;
+                         combobox-popup: 0; }}
+            QComboBox:hover, QComboBox:on {{ border-color: {t['border_strong']}; }}
+            QComboBox::drop-down {{ border: none; width: 26px; }}
+            QComboBox::down-arrow {{ image: url("{theme._svg_asset('chevron-down', t['ink_muted'])}");
+                                     width: 12px; height: 12px; }}
+        """)
+        # lista aberta: fundo, borda e cantos arredondados (a janela em volta é transparente)
+        self.combo.view().setStyleSheet(f"""
+            QListView {{ background: {t['surface']}; color: {t['ink']}; border: 1px solid {t['border_strong']};
+                         border-radius: 10px; padding: 4px; outline: 0; font-size: 12px; }}
+            QListView::item {{ border: none; }}
+        """)
+```
+
+O que mudou nele:
+
+- `combobox-popup: 0` faz a lista abrir **embaixo** da caixa (sem isso, ela abre por cima e o Windows
+  desenha as faixas pretas de rolagem);
+- o estilo da lista aberta saiu do `QComboBox QAbstractItemView` e foi para `self.combo.view()`, com borda
+  arredondada; a seleção e o destaque agora são desenhados pelo `_VersaoDelegate`.
 
 ---
 
 ## Teste
 
-1. Abra a tela **Prêmio** e veja a versão marcada de cada base.
-2. Com a tela aberta, coloque uma versão nova do `operacoes_xz` na pasta CETIP.
-3. Em até 4 segundos aparece `XZ: nova versão às HH:MM, não selecionada.`, e a versão marcada continua a mesma.
-4. Abra a lista do XZ: a versão nova está lá com a marca "mais recente". Escolha qualquer versão e o aviso
-   some.
-5. Renomeie o arquivo marcado do LZ: em até 4 segundos aparece o aviso vermelho, e a lista volta para a 1ª do
-   dia.
-
-Para mudar o intervalo, troque o `INTERVALO_VIGIA_MS` (em milissegundos) do Passo 2.
+1. Abra a tela **Prêmio** e clique no arquivo do XZ.
+2. A lista abre embaixo da caixa, sem faixas pretas, com "1ª do dia" em laranja, "mais recente" em cinza e ✓
+   na versão marcada.
+3. Troque o tema (lua/sol no canto) e abra de novo: as cores acompanham.
