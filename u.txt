@@ -1,3 +1,392 @@
+# CONTEXTO PARA CONTINUAR O DESENVOLVIMENTO
+
+Você vai me ajudar a alterar um script Python que já está funcionando. Leia todo o contexto antes de mexer no código.
+
+## Como quero que você trabalhe
+
+- **Não altere a lógica nem as regras de negócio existentes.** Mude só o que eu pedir.
+- Me devolva o **código completo** já ajustado, pronto para colar.
+- Se alguma alteração afetar outra parte do fluxo (cruzamento, controle, layout de saída), me avise antes.
+- Ambiente: Windows, Python 3.10+, pandas, pyodbc com DSN do Amazon Athena (Presto). A separação decimal dos arquivos é **ponto (.)**.
+
+## O que o script faz
+
+Gera o `MTCAIXA.txt` de **PAGAMENTO DE PRÊMIO** (lançamento 960) para importar no sistema:
+
+1. Lê o arquivo de operações da **CETIP** (.txt, separado por TAB) e filtra `Tipo Operação = PAGAMENTO DE PRÊMIO`, comparando sem acento.
+2. Monta a **query de posição LZ** no Athena só com os títulos encontrados (`LASTRO.codigo_clearing IN (...)`) e executa via ODBC (`executar_query_athena`).
+3. Cruza as duas bases por **conta e título**: `Conta` da CETIP só com os dígitos (`2385400-6` → `23854006`) = `cd_cetip`, e `Título` = `codigo_clearing`.
+4. **Valor lançado = valor da CETIP.** Se houver mais de uma operação para a mesma conta e título, cada uma recebe `TRUNC(qt × PU, 2)` e a sobra de centavos vai para a maior, fechando exatamente com o total da CETIP.
+5. **Data de lançamento e de liquidação** = `Data Liquidação` **da CETIP** (dd/mm/aaaa).
+6. **Controle** no console: compara a quantidade da posição com a da CETIP e `qt × PU` com o valor da CETIP. Os status são `OK`, `DIVERGE QTD` (principal alerta), `DIVERGE VALOR` e "sem posição" (título que não é lançado).
+7. Grava o `MTCAIXA.txt`: TAB, **cp1252**, CRLF, 18 colunas, uma linha por operação.
+
+## Pontos de atenção que já foram tratados (não quebrar)
+
+- O Athena devolve os nomes das colunas em minúsculo. O script aplica `.str.lower()` nos nomes.
+- O `cd_cetip` pode vir como número (`23854006.0`). A função `so_digitos` trata isso.
+- O arquivo da CETIP pode vir em UTF-8 ou cp1252. A função `ler()` testa os dois.
+- A descrição leva "PRÊMIO" com acento, e por isso a saída é gravada em cp1252.
+- Só entram posições com `quantidade_total > 0`.
+
+## Layout da linha do MTCAIXA
+
+```
+seq | dt_liq | sigla_carteira | MT | 960 | PAGAMENTO DE PRÊMIO {tipo_ativo} {codigo_clearing} {codigo_operacao} | valor | | | | N | dt_liq | N | N | REAL | valor | | 5
+```
+
+---
+
+# README ATUAL (exemplos de entrada e saída)
+
+# Gerador de MTCAIXA – Pagamento de Prêmio
+
+Script: `gerar_mtcaixa_premio.py`
+
+Lê o arquivo de **operações da CETIP**, filtra os eventos de **PAGAMENTO DE PRÊMIO**, consulta a **posição LZ no Mesh (Athena)** só dos títulos encontrados, cruza as duas bases e gera o `MTCAIXA.txt` (lançamento 960), pronto para importar no sistema.
+
+## 1. Requisitos
+
+| Item        | Detalhe |
+|-------------|---------|
+| Python      | 3.10+ (usa `pd.DataFrame \| None` na assinatura) |
+| Bibliotecas | `pandas`, `pyodbc` |
+| Driver      | Amazon Athena ODBC instalado e **DSN configurado** na máquina |
+| Acesso      | Leitura no database `db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01` |
+
+```
+pip install pandas pyodbc
+```
+
+---
+
+## 2. Configuração
+
+No topo do script:
+
+```python
+DSN_ATHENA   = "SEU_DSN_AQUI"             # nome do DSN ODBC do Athena
+ARQ_CETIP    = r"C:\caminho\OP_CETIP.txt" # arquivo de operações da CETIP
+ARQ_SAIDA    = r"C:\caminho\MTCAIXA.txt"  # arquivo gerado
+TIPO_EVENTO  = "PAGAMENTO DE PREMIO"      # filtro do Tipo Operação (comparado sem acento)
+COD_LANC     = "960"                      # código de lançamento no MTCAIXA
+```
+
+---
+
+## 3. Execução
+
+```
+python gerar_mtcaixa_premio.py
+```
+
+---
+
+## 4. Fluxo
+
+1. **CETIP** → lê o `.txt` (tab) e filtra `Tipo Operação = PAGAMENTO DE PRÊMIO`.
+2. **Query** → monta a query de posição LZ com os títulos do passo 1 (`codigo_clearing IN (...)`) e executa via ODBC.
+   - Pega a última posição de cada carteira na janela D-1 até D-5 dos dias com posição (sem contar hoje).
+   - Filtra `sigla_sistema_origem = 'LZ'` e `indicador_publico_privado = 'I'`.
+3. **Cruzamento** → `Conta` CETIP (só dígitos) = `CD_CETIP` e `Título` = `codigo_clearing`.
+4. **Valor lançado** → valor da CETIP.
+   - 1 operação na conta/título → recebe o valor CETIP integral.
+   - Mais de uma operação → cada uma recebe `TRUNC(qt × PU, 2)` e a sobra de centavos vai para a maior, fechando exatamente com o total da CETIP.
+5. **Controle** → compara `qt × PU` e a quantidade da posição com a CETIP.
+6. **Saída** → grava o `MTCAIXA.txt`.
+
+---
+
+## 5. Arquivos de entrada
+
+### 5.1 Operações CETIP (`.txt`, separado por TAB)
+
+Colunas usadas: **Conta, Tipo Operação, Título, Quantidade, PU, Valor, Data Liquidação** (as demais são ignoradas).
+
+```
+Participante (Nome Simpl)  Conta      Liquidante  CódOperação  Tipo Operação                 C/V   Tipo Compra/Venda  Título      Código IF Anterior  Tipo Título  Tipo de Regime  Eventos cursados pela Cetip?  Data Emissão  Data Vencimento  Quantidade  PU           Valor       Tx Colocação  Sistema  Modalidade Liquidação  Status                              Número Operação  ...  Data Liquidação  ...
+2496043023854FDO           2385400-6  ITAUBM      806          PAGAMENTO DE PRÊMIO DETENTOR  ----                     21A0677775  ----                CRI          DEPOSITADO      SIM                           26/01/2021    20/06/2034       250         1139.649781  284912.44   ----          CETIP21  Bruta STR              PENDENTE DE LIQUIDACAO FINANCEIRA   23559898         ...  18/11/2026       ...
+2496043023854FDO           2385400-6  ITAUBM      806          PAGAMENTO DE PRÊMIO DETENTOR  ----                     19F0210606  ----                CRI          DEPOSITADO      SIM                           10/06/2019    20/06/2034       1528        1302.381936  1990039.59  ----          CETIP21  Bruta STR              PENDENTE DE LIQUIDACAO FINANCEIRA   23547507         ...  18/11/2026       ...
+2496043023854FDO           2385400-6  ITAUBM      806          PAGAMENTO DE PRÊMIO DETENTOR  ----                     19F0211868  ----                CRI          DEPOSITADO      SIM                           10/06/2019    20/06/2034       766         1385.902692  1061601.46  ----          CETIP21  Bruta STR              PENDENTE DE LIQUIDACAO FINANCEIRA   23547508         ...  18/11/2026       ...
+2496043023854FDO           2385400-6  ITAUBM      806          PAGAMENTO DE PRÊMIO DETENTOR  ----                     20L0673034  ----                CRI          DEPOSITADO      SIM                           18/12/2020    20/06/2034       500         1244.886853  622443.42   ----          CETIP21  Bruta STR              PENDENTE DE LIQUIDACAO FINANCEIRA   23559332         ...  18/11/2026       ...
+```
+
+### 5.2 Posição Mesh (retorno da query no Athena)
+
+Gerada pelo próprio script. Colunas usadas: **CD_CETIP, codigo_clearing, sigla_carteira, codigo_operacao, tipo_ativo, quantidade_total**.
+
+```
+codigo_sistema,sigla_carteira,CD_ADM,CD_CETIP,data_posicao,dias_parado,codigo_operacao,codigo_lastro,tipo_ativo,indicador_publico_privado,data_aquisicao,data_vencimento,codigo_indexador,percentual_sobre_indexador,indicador_titulo,codigo_clearing,codigo_ativo_lastro,quantidade_disponivel,quantidade_bloqueada,quantidade_total,indicador_mtm,rn
+LZ,INTRKIINDICES,INTRAKIN,23854006,2026-11-17 00:00:00.000000,0,G798230,3229389,CRI-I,I,2019-06-26 00:00:00.000000,2026-11-18 00:00:00.000000,IPCADEF1,100.0,0,19F0210606,3229389,1528.0,0.0,1528.0,R,1
+```
+
+> O Athena devolve os nomes das colunas em minúsculo (`cd_cetip`), e o script trata isso. O `CD_CETIP` (`23854006`) é comparado com a `Conta` da CETIP sem o traço (`2385400-6`).
+
+---
+
+## 6. Arquivo de saída – `MTCAIXA.txt`
+
+- Separador: **TAB**
+- Encoding: **ANSI (cp1252)**, com quebra de linha **CRLF**
+- 18 colunas, **uma linha por operação**
+
+| #    | Conteúdo                                | Exemplo |
+|------|-----------------------------------------|---------|
+| 1    | Sequencial                              | `1` |
+| 2    | Data lançamento (Data Liquidação CETIP) | `18/11/2026` |
+| 3    | Carteira (`sigla_carteira`)             | `INTRKIINDICES` |
+| 4    | Fixo                                    | `MT` |
+| 5    | Código lançamento                       | `960` |
+| 6    | Descrição                               | `PAGAMENTO DE PRÊMIO CRI-I 19F0210606 G798230` |
+| 7    | Valor                                   | `1990039.59` |
+| 8–10 | Vazios                                  |  |
+| 11   | Fixo                                    | `N` |
+| 12   | Data liquidação                         | `18/11/2026` |
+| 13   | Fixo                                    | `N` |
+| 14   | Fixo                                    | `N` |
+| 15   | Moeda                                   | `REAL` |
+| 16   | Valor                                   | `1990039.59` |
+| 17   | Vazio                                   |  |
+| 18   | Fixo                                    | `5` |
+
+Exemplo (`→` = TAB):
+
+```
+1→18/11/2026→INTRKIINDICES→MT→960→PAGAMENTO DE PRÊMIO CRI-I 19F0210606 G798230→1990039.59→→→→N→18/11/2026→N→N→REAL→1990039.59→→5
+```
+
+Exemplo com título dividido em duas operações (a soma fecha com a CETIP, 1990039.59):
+
+```
+1→18/11/2026→CART_B→MT→960→PAGAMENTO DE PRÊMIO CRI-I 19F0210606 TESTE2→687657.66→→→→N→18/11/2026→N→N→REAL→687657.66→→5
+2→18/11/2026→INTRKIINDICES→MT→960→PAGAMENTO DE PRÊMIO CRI-I 19F0210606 G798230→1302381.93→→→→N→18/11/2026→N→N→REAL→1302381.93→→5
+```
+
+---
+
+## 7. Controle (saída no console)
+
+```
+CONTROLE:
+    Conta      Título  qt_pos  qt_cetip  valor_calc  valor_cetip  valor_lancado  dif_qt  dif_valor       status
+2385400-6  19F0210606  1528.0    1528.0  1990039.59   1990039.59     1990039.59     0.0       0.00           OK
+2385400-6  20L0673034   499.0     500.0   621198.53    622443.42      622443.42    -1.0   -1244.89  DIVERGE QTD
+
+*** ATENÇÃO: há divergência entre posição e CETIP - verificar antes de importar.
+
+*** Evento na CETIP SEM posição (não lançado):
+    Conta      Título  Quantidade      Valor
+2385400-6  21A0677775       250.0  284912.44
+```
+
+| Status          | Significado |
+|-----------------|-------------|
+| `OK`            | Quantidade e valor batem |
+| `DIVERGE QTD`   | Quantidade da posição ≠ quantidade da CETIP (**principal alerta**). A linha é gravada mesmo assim, com o valor da CETIP |
+| `DIVERGE VALOR` | Quantidade bate, mas `qt × PU` difere da CETIP em mais de R$ 0,01 por operação |
+| Sem posição     | Evento na CETIP sem posição no Mesh. **Não é lançado** |
+
+---
+
+## 8. Observações
+
+- O valor lançado é sempre o da CETIP. A conta `qt × PU` (truncada em 2 casas) serve só de controle e para dividir o valor entre operações.
+- A `Conta` da CETIP é comparada só pelos dígitos (`2385400-6` → `23854006`).
+- Para outros eventos (juros, amortização), basta trocar `TIPO_EVENTO` e `COD_LANC`.
+
+---
+
+# CÓDIGO ATUAL (`gerar_mtcaixa_premio.py`)
+
+```python
+"""
+Gera MTCAIXA.txt de PAGAMENTO DE PRÊMIO (lançamento 960)
+1) Lê o arquivo de operações da CETIP e filtra o evento
+2) Monta a query de posição (LZ) com os títulos encontrados e executa no Athena
+3) Cruza Conta CETIP + Título x CD_CETIP + codigo_clearing
+4) Valor lançado = Valor da CETIP (rateado por operação quando houver mais de uma)
+   Data lançamento/liquidação = Data Liquidação do arquivo da CETIP
+   Conta qt * PU apenas como CONTROLE (quantidade e valor)
+"""
+import pandas as pd
+from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
+
+DSN_ATHENA   = "SEU_DSN_AQUI"
+ARQ_CETIP    = r"EXEMPLO_OP_CETIP.txt"
+ARQ_SAIDA    = r"MTCAIXA.txt"
+TIPO_EVENTO  = "PAGAMENTO DE PREMIO"   # comparado sem acento
+COD_LANC     = "960"
+
+DB = "db_corp_custodiademercadodecapitais_hubdadosinvesmentservices_sor_01"
+
+
+# ------------------------------------------------------------------ utilitários
+def ler(arq, sep):
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return pd.read_csv(arq, sep=sep, dtype=str, encoding=enc)
+        except UnicodeDecodeError:
+            pass
+
+
+def sem_acento(s):
+    return (s.str.upper().str.normalize("NFKD")
+             .str.encode("ascii", "ignore").str.decode("ascii").str.strip())
+
+
+def so_digitos(s):
+    # trata int/float/str vindos do ODBC (ex.: 23854006, 23854006.0, '2385400-6')
+    return (s.astype(str).str.strip()
+             .str.replace(r"\.0+$", "", regex=True)
+             .str.replace(r"\D", "", regex=True))
+
+
+def trunc2(x):
+    return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+# ------------------------------------------------------------------ Athena
+def executar_query_athena(query: str) -> pd.DataFrame | None:
+    """Executa a query via ODBC (DSN configurado na máquina) e devolve um DataFrame."""
+    import pyodbc  # aqui dentro: a Central abre mesmo sem o driver instalado
+    try:
+        connection = pyodbc.connect(f"DSN={DSN_ATHENA}", timeout=30)
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [column[0] for column in cursor.description]
+        results = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return pd.DataFrame.from_records(results, columns=columns)
+    except pyodbc.Error as e:
+        print("Erro ao conectar ou executar a query:", e)
+        return None
+
+
+def montar_query_posicao(titulos: list[str]) -> str:
+    lista = ", ".join(f"'{t}'" for t in sorted(set(titulos)))
+    return f"""
+WITH datas AS (
+    SELECT DISTINCT data_posicao
+    FROM {DB}.tbih3_posicao_fundo_renda_fixa
+    WHERE data_posicao >= CAST(current_date - INTERVAL '15' DAY AS TIMESTAMP)
+      AND data_posicao <  CAST(current_date AS TIMESTAMP)
+      AND sigla_sistema_origem = 'LZ'
+      AND indicador_publico_privado = 'I'
+),
+janela AS (
+    SELECT data_posicao,
+           ROW_NUMBER() OVER (ORDER BY data_posicao DESC) - 1 AS dias_parado
+    FROM datas
+),
+ultima AS (
+    SELECT P.sigla_carteira, MAX(P.data_posicao) AS data_posicao
+    FROM {DB}.tbih3_posicao_fundo_renda_fixa P
+    JOIN janela J
+      ON J.data_posicao = P.data_posicao
+     AND J.dias_parado <= 5
+    WHERE P.sigla_sistema_origem = 'LZ'
+      AND P.indicador_publico_privado = 'I'
+    GROUP BY P.sigla_carteira
+),
+base AS (
+    SELECT
+      POSICAO.sigla_sistema_origem AS codigo_sistema,
+      POSICAO.sigla_carteira,
+      CAD_CART.codigo_administrador AS CD_ADM,
+      CAD_CART_SAC.codigo_cetip AS CD_CETIP,
+      POSICAO.data_posicao,
+      J.dias_parado,
+      TRIM(POSICAO.codigo_operacao) AS codigo_operacao,
+      LASTRO.codigo_lastro,
+      LASTRO.tipo_ativo,
+      POSICAO.indicador_publico_privado,
+      POSICAO.data_aquisicao,
+      data_vencimento,
+      POSICAO.codigo_indexador,
+      LASTRO.percentual_sobre_indexador,
+      POSICAO.indicador_titulo,
+      LASTRO.codigo_clearing,
+      POSICAO.codigo_ativo_lastro,
+      POSICAO.quantidade_disponivel,
+      POSICAO.quantidade_bloqueada,
+      POSICAO.quantidade_total,
+      LASTRO.indicador_mtm,
+      ROW_NUMBER() OVER (
+          PARTITION BY POSICAO.sigla_sistema_origem,
+                       POSICAO.sigla_carteira,
+                       POSICAO.data_posicao,
+                       TRIM(POSICAO.codigo_operacao),
+                       POSICAO.codigo_ativo_lastro
+          ORDER BY POSICAO.data_democratizacao DESC
+      ) AS rn
+    FROM {DB}.tbih3_posicao_fundo_renda_fixa POSICAO
+    JOIN ultima U
+      ON POSICAO.sigla_carteira = U.sigla_carteira
+     AND POSICAO.data_posicao   = U.data_posicao
+    JOIN janela J
+      ON J.data_posicao = U.data_posicao
+    JOIN {DB}.tbih3_cadastro_carteira_codigo CART_COD
+      ON POSICAO.sigla_carteira = TRIM(CART_COD.sigla_carteira)
+     AND POSICAO.sigla_sistema_origem = CART_COD.sigla_sistema_origem
+    JOIN {DB}.tbih3_cadastro_ativo_lastro_renda_fixa LASTRO
+      ON POSICAO.codigo_ativo_lastro = LASTRO.codigo_lastro
+     AND POSICAO.sigla_sistema_origem = LASTRO.sigla_sistema_origem
+    JOIN {DB}.tbih3_cadastro_carteira CAD_CART
+      ON TRIM(CAD_CART.sigla_carteira) = POSICAO.sigla_carteira
+     AND POSICAO.sigla_sistema_origem = CAD_CART.sigla_sistema_origem
+    JOIN {DB}.tbih3_cadastro_carteira_complemento_sac CAD_CART_SAC
+      ON POSICAO.sigla_carteira = TRIM(CAD_CART_SAC.sigla_carteira)
+     AND POSICAO.sigla_sistema_origem = CAD_CART_SAC.sigla_sistema_origem
+    WHERE POSICAO.sigla_sistema_origem = 'LZ'
+      AND POSICAO.indicador_publico_privado = 'I'
+      AND LASTRO.codigo_clearing IN ({lista})
+)
+SELECT *
+FROM base
+WHERE rn = 1
+ORDER BY dias_parado DESC, sigla_carteira
+"""
+
+
+# ------------------------------------------------------------------ processo
+def main():
+    # 1) CETIP -> eventos do tipo desejado
+    cetip = ler(ARQ_CETIP, "\t")
+    cetip.columns = cetip.columns.str.strip()
+    cetip = cetip.apply(lambda s: s.str.strip())
+    ev = cetip[sem_acento(cetip["Tipo Operação"]) == TIPO_EVENTO].copy()
+    if ev.empty:
+        print(f"Nenhum evento '{TIPO_EVENTO}' no arquivo da CETIP.")
+        return
+    ev["conta"] = so_digitos(ev["Conta"])
+    ev["PU"] = ev["PU"].astype(float)
+    ev["Quantidade"] = ev["Quantidade"].astype(float)
+    ev["Valor"] = ev["Valor"].astype(float)
+    ev = ev[["conta", "Conta", "Título", "PU", "Quantidade", "Valor", "Data Liquidação"]]
+
+    # 2) Posição via Athena
+    query = montar_query_posicao(ev["Título"].tolist())
+    pos = executar_query_athena(query)
+    if pos is None or pos.empty:
+        print("Query de posição não retornou dados.")
+        return
+    pos.columns = pos.columns.str.lower()   # Athena devolve alias em minúsculo
+    for c in ("sigla_carteira", "codigo_operacao", "codigo_clearing", "tipo_ativo"):
+        pos[c] = pos[c].astype(str).str.strip()
+    pos["conta"] = so_digitos(pos["cd_cetip"])
+    pos["quantidade_total"] = pos["quantidade_total"].astype(float)
+    pos = pos[pos["quantidade_total"] > 0]
+
+    base = pos.merge(ev, left_on=["conta", "codigo_clearing"],
+                     right_on=["conta", "Título"], how="inner", validate="m:1")
+    base = base.sort_values(["Conta", "Título", "quantidade_total", "codigo_operacao"],
+                            ascending=[True, True, False, True]).reset_index(drop=True)
+
+    # Valor de controle por operação: TRUNC(qt * PU, 2)
+    base["valor_calc"] = [trunc2(q * p) for q, p in zip(base["quantidade_total"], base["PU"])]
+
     # Valor lançado = CETIP. Com 1 operação -> valor CETIP direto.
     # Com várias -> qt*PU em cada uma e a sobra de centavos vai na maior operação,
     # garantindo que a soma bata exatamente com a CETIP.
@@ -47,3 +436,4 @@
 
 if __name__ == "__main__":
     main()
+```
