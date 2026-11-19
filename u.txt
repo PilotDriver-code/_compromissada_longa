@@ -1,119 +1,49 @@
-# Exportar carteiras (Cravar PU)
+    # Valor lançado = CETIP. Com 1 operação -> valor CETIP direto.
+    # Com várias -> qt*PU em cada uma e a sobra de centavos vai na maior operação,
+    # garantindo que a soma bata exatamente com a CETIP.
+    base["valor"] = base["valor_calc"]
+    for _, g in base.groupby(["Conta", "Título"]):
+        total_cetip = Decimal(str(g["Valor"].iloc[0])).quantize(Decimal("0.01"))
+        if len(g) == 1:
+            base.loc[g.index[0], "valor"] = total_cetip
+        else:
+            base.loc[g.index[0], "valor"] = total_cetip - sum(g["valor_calc"].iloc[1:])
 
-Quando o interruptor **Exportar carteiras** estiver ligado, o Cravar PU gera, para cada base
-processada, um `carteiras_<BASE>.txt` com as carteiras da **coluna A** dos arquivos da base.
+    # 3) Conferência / controle posição x CETIP
+    chk = base.groupby(["Conta", "Título"]).agg(
+        qt_pos=("quantidade_total", "sum"), qt_cetip=("Quantidade", "first"),
+        valor_calc=("valor_calc", "sum"), valor_cetip=("Valor", "first"),
+        valor_lancado=("valor", "sum"), n_oper=("codigo_operacao", "count")).reset_index()
+    chk["dif_qt"] = chk["qt_pos"] - chk["qt_cetip"]
+    chk["dif_valor"] = (chk["valor_calc"].astype(float) - chk["valor_cetip"]).round(2)
+    chk["status"] = "OK"
+    chk.loc[chk["dif_valor"].abs() > 0.01 * chk["n_oper"], "status"] = "DIVERGE VALOR"
+    chk.loc[chk["dif_qt"] != 0, "status"] = "DIVERGE QTD"
+    print("CONTROLE:\n", chk.drop(columns="n_oper").to_string(index=False))
+    if (chk["status"] != "OK").any():
+        print("\n*** ATENÇÃO: há divergência entre posição e CETIP - verificar antes de importar.")
 
-```
-Cravar PU\
-  LZ\
-    AJUSTE_LZ_parte_1.csv
-    AJUSTE_LZ_parte_2.csv
-    carteiras_LZ.txt        ← uma carteira por linha, sem repetir, em ordem
-  XZ\
-    AJUSTE_XZ_parte_1.csv
-    carteiras_XZ.txt
-```
+    chave_ok = set(zip(base["conta"], base["Título"]))
+    faltam = ev[[(c, t) not in chave_ok for c, t in zip(ev["conta"], ev["Título"])]]
+    if not faltam.empty:
+        print("\n*** Evento na CETIP SEM posição (não lançado):\n",
+              faltam[["Conta", "Título", "Quantidade", "Valor"]].to_string(index=False))
 
-## A ideia
+    base = base.sort_values(["sigla_carteira", "codigo_clearing", "codigo_operacao"])
 
-As carteiras são lidas do **arquivo geral** (`arquivo_final_ajuste`), **antes** de ele ser
-quebrado em partes de 4.000 linhas. Assim:
+    # 4) MTCAIXA (18 colunas, tab, cp1252, CRLF)
+    linhas = []
+    for i, r in enumerate(base.to_dict("records"), start=1):
+        dt = pd.to_datetime(r["Data Liquidação"], dayfirst=True).strftime("%d/%m/%Y")
+        v = f"{r['valor']:.2f}"
+        desc = f"PAGAMENTO DE PRÊMIO {r['tipo_ativo']} {r['codigo_clearing']} {r['codigo_operacao']}"
+        linhas.append("\t".join([str(i), dt, r["sigla_carteira"], "MT", COD_LANC, desc, v,
+                                 "", "", "", "N", dt, "N", "N", "REAL", v, "", "5"]))
 
-- não é preciso reler os CSVs gerados;
-- uma carteira espalhada em duas partes aparece uma vez só;
-- a lista sai exatamente do mesmo dado que foi gravado.
+    if linhas:
+        Path(ARQ_SAIDA).write_text("\r\n".join(linhas) + "\r\n", encoding="cp1252")
+    print(f"\n{len(linhas)} linhas gravadas em {ARQ_SAIDA}")
 
-O TXT é sobrescrito a cada execução, como os CSVs. Com o interruptor desligado, nada é gerado.
 
----
-
-Todas as mudanças são em `tasks/cravar_pu/cravar_pu.py`, na função `executar`.
-
-## Passo 1: Lista de controle, antes do `for`
-
-Logo antes de `for i, base in enumerate(bases, start=1):`:
-
-```python
-    carteiras_exportadas = []   # (base, quantidade, caminho do txt), para o resumo no fim
-```
-
-## Passo 2: Gerar o TXT de cada base, dentro do `for`
-
-Entre o `mkdir` da pasta da base e o `salvar_e_dividir`:
-
-```python
-            pasta_saida = saida / base
-            pasta_saida.mkdir(parents=True, exist_ok=True)
-
-            # Exportar carteiras: pega a coluna A do arquivo geral, ANTES de quebrar em partes
-            if params["exportar_carteiras"]:
-                carteiras = (arquivo_final_ajuste.iloc[:, 0]
-                             .dropna().astype(str).str.strip())
-                carteiras = sorted(c for c in carteiras.unique() if c)
-
-                caminho_txt = pasta_saida / f"carteiras_{base}.txt"
-                caminho_txt.write_text("\n".join(carteiras) + "\n", encoding="utf-8")
-                carteiras_exportadas.append((base, len(carteiras), caminho_txt))
-
-                if carteiras:
-                    ctx.log(f"{base}: {len(carteiras)} carteira(s) exportada(s)", "ok")
-                else:
-                    ctx.log(f"{base}: nenhuma carteira na coluna A, o TXT ficou vazio", "warn")
-
-            salvar_e_dividir(arquivo_final_ajuste, str(pasta_saida), prefixo=f"AJUSTE_{base}_parte")
-```
-
-## Passo 3: Resumo no console, depois do `for`
-
-Depois que o `for` termina e antes do `return` (indentação do `for`, não de dentro dele):
-
-```python
-    if carteiras_exportadas:
-        ctx.table("Carteiras exportadas",
-                  [(base, f"{qtd} carteira(s)") for base, qtd, _ in carteiras_exportadas])
-        ctx.files([caminho for _, _, caminho in carteiras_exportadas], "Listas de carteiras")
-```
-
-> Usa `ctx.table` e `ctx.files`, do console novo (o mesmo do Eventos SAC).
-
-## Passo 4: Mensagem final
-
-Troque o `return` do fim do `executar` por:
-
-```python
-    msg = f"PU cravado para {processadas} de {len(bases)} base(s)."
-    if carteiras_exportadas:
-        msg += f" Carteiras exportadas: {len(carteiras_exportadas)} arquivo(s)."
-    return msg
-```
-
-## Opcional: explicar o interruptor na tela
-
-Em `app/pages/cravar_pu.py`, troque:
-
-```python
-        self.sw_carteiras = SwitchRow("Exportar carteiras")
-```
-
-por:
-
-```python
-        self.sw_carteiras = SwitchRow("Exportar carteiras",
-                                      "Gera um carteiras_<BASE>.txt com as carteiras da coluna A.")
-```
-
----
-
-## Confira antes de testar
-
-Abra um CSV gerado e veja se a **coluna A** tem mesmo as carteiras. Se o TXT vier com números
-como 0, 1, 2… ou outra informação, o `salvar_e_dividir` está gravando o índice ou mudando a
-ordem das colunas. Nesse caso, troque `.iloc[:, 0]` pelo nome da coluna, por exemplo
-`arquivo_final_ajuste["CARTEIRA"]`.
-
-## Teste
-
-1. No Cravar PU, marque **LZ** e **XZ** e ligue **Exportar carteiras**.
-2. Processe.
-3. Confira `Cravar PU\LZ\carteiras_LZ.txt` e `Cravar PU\XZ\carteiras_XZ.txt`.
-4. No fim do console aparecem a tabela **Carteiras exportadas** e os links para os TXT.
+if __name__ == "__main__":
+    main()
