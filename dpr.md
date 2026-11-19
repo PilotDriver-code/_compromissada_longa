@@ -1,230 +1,276 @@
-# Prêmio: ignorar tipos de título e tirar a operação da descrição
+# Prêmio: vigiar a pasta CETIP (versões novas dos arquivos de operações)
 
-Duas mudanças no Lançamento de prêmio:
+Enquanto a tela **Prêmio** está aberta, a Central confere a pasta `setup\Arquivos Conciliacao\CETIP`
+**a cada 4 segundos**, igual ao Cravar PU com o de-para.
 
-1. **Só entram prêmios de CRI, CRA, DEB e NC**, pela coluna **"Tipo Título"** dos arquivos de operações.
-   Prêmio de outro tipo (LF, CDB...) é ignorado: não busca posição, não aparece no radar e não entra no
-   MTCAIXA. O console mostra quantos foram ignorados de cada tipo.
-2. **A descrição do MTCAIXA não leva mais o código da operação.** Continua uma linha por carteira + título,
-   com o valor somado de todos os trades.
+- **Versão nova:** entra na lista com a marca "mais recente". A versão marcada **não muda sozinha**,
+  continua a que você escolheu (por padrão, a 1ª do dia). Embaixo dos arquivos aparece, em laranja:
+  `XZ: nova versão às 13:38, não selecionada.`
+- **Arquivo marcado sumiu** (apagado ou renomeado): a lista volta para a 1ª do dia e aparece, em vermelho:
+  `LZ: a versão marcada saiu da pasta (Operacoes_19112026_0742.txt). Confira a escolha.`
+- O aviso some quando você escolhe uma versão na lista daquela base.
+- Com a lista aberta, a Central não mexe nela: confere de novo no ciclo seguinte.
+- A conferência para quando você sai da tela e enquanto o MTCAIXA está sendo gerado.
 
-```
-antes:  PAGAMENTO DE PRÊMIO CRI-I CRI020118TT OP1102
-depois: PAGAMENTO DE PRÊMIO CRI-I CRI020118TT
-```
-
-> Este passo a passo parte do **primeiro zip**, que ainda não ignorava tipos.
-> Se você já copiou o zip das 12:31 (que ignora os tipos e acha a coluna "Tipo Título" sozinho), faça só o
-> **Passo 6**. Nos dois casos, o mais fácil é copiar o zip novo inteiro por cima.
-
-Arquivos alterados:
-
-| Passo | Arquivo                       | O que muda                                  |
-|-------|-------------------------------|---------------------------------------------|
-| 1     | `tasks\premio\parametros.py`  | lista dos tipos aceitos                     |
-| 2     | `tasks\premio\leitura.py`     | lê a coluna "Tipo Título" e filtra          |
-| 3     | `tasks\premio\calculo.py`     | guarda o tipo no título do dia              |
-| 4     | `tasks\premio\premio.py`      | aviso no console                            |
-| 5     | `app\pages\premio.py`         | coluna Tipo da aba Títulos do dia           |
-| 6     | `tasks\premio\saida.py`       | descrição do MTCAIXA sem a operação         |
+Todas as mudanças são em **`app\pages\premio.py`**.
 
 ---
 
-## Passo 1: `tasks\premio\parametros.py`
+## Passo 1: import do QtCore
 
-Logo abaixo de `TIPOS_EVENTO = ["PAGAMENTO DE PREMIO"]`, acrescente:
+No topo do arquivo, troque:
 
 ```python
-# Tipos de título que entram. Prêmio de outro tipo (LF, CDB...) é ignorado e aparece como aviso.
-TIPOS_TITULO = ["CRI", "CRA", "DEB", "NC"]
+from ..qt import QtGui, QtWidgets, Qt, Signal
 ```
 
-Para aceitar outro tipo no futuro, é só acrescentar nessa lista.
+por:
+
+```python
+from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
+```
 
 ---
 
-## Passo 2: `tasks\premio\leitura.py`
+## Passo 2: texto padrão e intervalo
 
-### 2a. Coluna nova no dicionário `COLUNAS`
-
-Acrescente a última linha:
+Logo abaixo dos imports, antes de `# Ícone do menu`, acrescente:
 
 ```python
-    "data_liq": "data liquidacao",
-    "tipo_titulo": "tipo titulo",       # coluna "Tipo Título": CRI, CRA, DEB, NC...
-}
+HINT_ARQUIVOS = ("Padrão: a 1ª versão do dia. Os dois juntos formam a lista de "
+                 "títulos do dia, que vale para LZ, XZ e BN7.")
+INTERVALO_VIGIA_MS = 4000   # de quanto em quanto tempo a tela confere a pasta CETIP
 ```
 
-Com isso, se o arquivo vier sem a coluna "Tipo Título", a Central para e mostra as colunas que encontrou.
+---
 
-### 2b. Campo novo na classe `LinhaCetip`
+## Passo 3: classe `SeletorArquivo`
 
-No fim da classe, depois de `data_liq: date`:
+### 3a. Memória dos arquivos que já estavam na pasta
+
+No `__init__`, troque:
 
 ```python
-    tipo_titulo: str = ""  # CRI, CRA, DEB, NC (coluna do arquivo)
+        self._extra: Path | None = None   # arquivo escolhido fora da pasta CETIP
+        self.restyle()
 ```
 
-### 2c. Campo novo na classe `Leitura`
-
-No fim da classe, depois de `total_linhas: int`:
+por:
 
 ```python
-    outros_tipos: dict = None   # tipo de título fora de TIPOS_TITULO -> quantidade (ignorados)
+        self._extra: Path | None = None   # arquivo escolhido fora da pasta CETIP
+        self._conhecidos: set | None = None   # arquivos que já estavam na pasta (para achar versão nova)
+        self.restyle()
 ```
 
-> Ele tem que ficar **depois** de `total_linhas`. Antes dele, o Python dá erro ao abrir
-> ("non-default argument follows default argument").
+### 3b. `recarregar` passa a dizer o que mudou
 
-### 2d. Na função `ler_operacoes`, a lista dos tipos aceitos
-
-Logo depois da linha `col = {interna: por_nome[nome] for interna, nome in COLUNAS.items()}`:
+Troque o começo do método, de `def recarregar(self):` até `self.combo.blockSignals(True)`:
 
 ```python
-    tipos_ok = {sem_acento(t) for t in P.TIPOS_TITULO}
+    def recarregar(self):
+        from tasks.premio import versoes as V
+
+        atual = self.caminho()
+        versoes = V.listar_versoes(self._pasta_fn(), self.base)
+        self.combo.blockSignals(True)
 ```
 
-### 2e. Contador dos ignorados
+por:
+
+```python
+    def recarregar(self) -> dict:
+        """Relista as versões sem trocar a escolhida.
+
+        Devolve {"novas": [(caminho, quando)], "sumiu": nome ou None}:
+        novas = versões que apareceram desde a última conferência;
+        sumiu = a versão marcada não existe mais (a lista volta para a 1ª do dia).
+        """
+        from tasks.premio import versoes as V
+
+        atual = self.caminho()
+        versoes = V.listar_versoes(self._pasta_fn(), self.base)
+        caminhos = {str(p) for p, _ in versoes}
+        anteriores = self._conhecidos
+        sumiu = Path(atual).name if atual and not Path(atual).is_file() else None
+        if anteriores is not None and caminhos == anteriores and not sumiu:
+            return {"novas": [], "sumiu": None}          # nada mudou na pasta
+        if self.combo.view().isVisible():
+            return {"novas": [], "sumiu": None}          # lista aberta: não mexe agora, confere no próximo ciclo
+        self._conhecidos = caminhos
+        novas = [] if anteriores is None else [(p, q) for p, q in versoes if str(p) not in anteriores]
+
+        self.combo.blockSignals(True)
+```
+
+> Quando a pasta não mudou, o método sai logo no começo e não remonta a lista.
+> Por isso a conferência a cada 4 s não pisca a tela nem perde a sua escolha.
+
+### 3c. Fim do `recarregar`
+
+No fim do método, depois de `self._tooltip()`, acrescente o `return`:
+
+```python
+        self.combo.setCurrentIndex(max(i, 0))
+        self.combo.blockSignals(False)
+        self._tooltip()
+        return {"novas": novas, "sumiu": sumiu}
+```
+
+### 3d. Botão de pasta (escolher outro arquivo)
+
+No método `_escolher`, troque:
+
+```python
+        self._extra = Path(caminho)
+        self.recarregar()
+```
+
+por:
+
+```python
+        self._extra = Path(caminho)
+        self._conhecidos = None   # força montar a lista de novo, já com o arquivo escolhido
+        self.recarregar()
+```
+
+Sem essa linha, o arquivo escolhido fora da pasta não entraria na lista, porque o conteúdo da pasta não mudou.
+
+---
+
+## Passo 4: classe `PremioPage`, no `__init__`
+
+### 4a. Guardar os avisos
+
+Logo depois de `self._tarefa = ""`:
+
+```python
+        self._avisos: dict[str, tuple[str, str]] = {}   # base -> (texto, tom) do aviso dos arquivos
+```
+
+### 4b. O relógio
+
+Logo depois de `self._limpar_resultado()` (última linha do `__init__`):
+
+```python
+        # Enquanto a tela está aberta, confere a pasta CETIP a cada 4 s (versão nova, arquivo que sumiu)
+        self._relogio = QtCore.QTimer(self)
+        self._relogio.setInterval(INTERVALO_VIGIA_MS)
+        self._relogio.timeout.connect(self._vigiar_arquivos)
+```
+
+---
+
+## Passo 5: `_painel_parametros`
 
 Troque:
 
 ```python
-    linhas, invalidas, variacoes = [], [], {}
+        self.f_arquivos = Field("Arquivos de operações CETIP", caixa,
+                                "Padrão: a 1ª versão do dia. Os dois juntos formam a lista de "
+                                "títulos do dia, que vale para LZ, XZ e BN7.")
 ```
 
 por:
 
 ```python
-    linhas, invalidas, variacoes, outros_tipos = [], [], {}, {}
+        for base, s in self.seletores.items():
+            s.combo.activated.connect(lambda _, b=base: self._limpar_aviso(b))   # o usuário escolheu
+        self.f_arquivos = Field("Arquivos de operações CETIP", caixa, HINT_ARQUIVOS)
 ```
 
-### 2f. O filtro, dentro do `for`
-
-Entre o `continue` das variações e o `try:`:
-
-```python
-            continue
-        tipo_titulo = sem_acento(reg[col["tipo_titulo"]])
-        if tipo_titulo not in tipos_ok:
-            chave = tipo_titulo or "(vazio)"
-            outros_tipos[chave] = outros_tipos.get(chave, 0) + 1
-            continue
-        try:
-```
-
-O tipo é comparado sem acento e sem diferenciar maiúsculas (`cri` e `CRI` entram).
-
-### 2g. Guardar o tipo na linha
-
-No fim do `for`, acrescente `tipo_titulo` ao criar a `LinhaCetip`:
-
-```python
-        linhas.append(LinhaCetip(arquivo, i, conta, str(reg[col["conta"]]).strip(), titulo,
-                                 campos["qtd"], campos["pu"], campos["valor"], data_liq, tipo_titulo))
-```
-
-### 2h. Devolver os ignorados
-
-Troque o `return` da função por:
-
-```python
-    return Leitura(caminho, arquivo, linhas, invalidas, variacoes, len(df), outros_tipos)
-```
+> O `activated` só dispara quando **você** escolhe na lista; a atualização automática não dispara.
+> Assim o aviso some só quando você mesmo olhou e escolheu.
 
 ---
 
-## Passo 3: `tasks\premio\calculo.py`
+## Passo 6: ligar e desligar a conferência + os métodos novos
 
-### 3a. Campo novo na classe `TituloDia`
-
-Troque a linha `tipo_ativo: str = ""` por:
+Troque o `on_shown` inteiro:
 
 ```python
-    tipo_ativo: str = ""          # da posição (ex.: CRI-I), usado na descrição do MTCAIXA
-    tipo_titulo: str = ""         # do arquivo de operações (CRI, CRA, DEB, NC)
-```
-
-### 3b. Preencher o tipo
-
-Na função `montar_titulos`, logo abaixo de `t.contas[l.arquivo].add(l.conta)`:
-
-```python
-        t.tipo_titulo = t.tipo_titulo or l.tipo_titulo
-```
-
----
-
-## Passo 4: `tasks\premio\premio.py` (aviso no console)
-
-No bloco `[1] Leitura`, logo antes de `for tipo, qtd in leitura.variacoes.items():`:
-
-```python
-        if leitura.outros_tipos:
-            ctx.log(f"{arquivo}: prêmio de outros tipos ignorado: " + ", ".join(
-                f"{tipo} {qtd}" for tipo, qtd in sorted(leitura.outros_tipos.items()))
-                + f" (entram só {', '.join(P.TIPOS_TITULO)})", "warn")
-```
-
-No console, fica assim:
-
-```
-! LZ: prêmio de outros tipos ignorado: CDB 1, LF 1 (entram só CRI, CRA, DEB, NC)
-```
-
----
-
-## Passo 5: `app\pages\premio.py` (coluna Tipo da aba Títulos do dia)
-
-Em `_preencher_titulos`, troque:
-
-```python
-                item(tit.tipo_ativo or "—", AL_C, t["ink_faint"] if not tit.tipo_ativo else None),
+    def on_shown(self):
+        super().on_shown()
+        for s in self.seletores.values():
+            s.recarregar()
+        self._status_aws()
 ```
 
 por:
 
 ```python
-                item(tit.tipo_titulo or tit.tipo_ativo or "—", AL_C,
-                     None if (tit.tipo_titulo or tit.tipo_ativo) else t["ink_faint"]),
-```
+    def on_shown(self):
+        super().on_shown()
+        self._vigiar_arquivos()
+        self._relogio.start()
+        self._status_aws()
 
-Assim a coluna mostra CRI, CRA, DEB ou NC, que vem do arquivo, mesmo quando o título não tem posição.
+    def hideEvent(self, event):  # noqa: N802 - para de conferir quando sai da tela
+        self._relogio.stop()
+        super().hideEvent(event)
+
+    # Vigia da pasta CETIP -------------------------------------------------------
+    def _vigiar_arquivos(self):
+        if self.is_busy():
+            return
+        for base, s in self.seletores.items():
+            r = s.recarregar()
+            if r["sumiu"]:
+                self._avisos[base] = (f"{base}: a versão marcada saiu da pasta ({r['sumiu']}). "
+                                      f"Confira a escolha.", "error")
+            elif r["novas"]:
+                p, quando = r["novas"][-1]
+                self._avisos[base] = (f"{base}: nova versão às {quando:%H:%M}, não selecionada.", "warn")
+        self._mostrar_avisos()
+
+    def _limpar_aviso(self, base: str):
+        self._avisos.pop(base, None)
+        self._mostrar_avisos()
+
+    def _mostrar_avisos(self):
+        if not self._avisos:
+            self.f_arquivos.set_hint(HINT_ARQUIVOS)
+            return
+        tom = "error" if any(t == "error" for _, t in self._avisos.values()) else "warn"
+        self.f_arquivos.set_hint("\n".join(txt for txt, _ in self._avisos.values()), tom)
+```
 
 ---
 
-## Passo 6: `tasks\premio\saida.py` (tirar a operação da descrição)
+## Passo 7: `run()`
 
-Na função `linha_mtcaixa`, troque:
+No `run`, troque:
 
 ```python
-    descricao = f"{P.DESC_EVENTO} {tipo_ativo} {titulo} {operacao}".strip()
+            self.toast(f"Arquivo de operações não encontrado: {', '.join(faltando)}. Escolha de novo.", "error")
+            for s in self.seletores.values():
+                s.recarregar()
+            return
+        self.f_arquivos.set_hint("Padrão: a 1ª versão do dia. Os dois juntos formam a lista de "
+                                 "títulos do dia, que vale para LZ, XZ e BN7.")
 ```
 
 por:
 
 ```python
-    descricao = f"{P.DESC_EVENTO} {tipo_ativo} {titulo}".strip()   # sem o código da operação
+            self.toast(f"Arquivo de operações não encontrado: {', '.join(faltando)}. Escolha de novo.", "error")
+            self._vigiar_arquivos()
+            return
+        self._mostrar_avisos()
 ```
 
-Se quiser, atualize o comentário da coluna 6, mais abaixo na mesma função:
-
-```python
-        descricao,         # 6  PAGAMENTO DE PRÊMIO <tipo_ativo> <título>
-```
-
-Não precisa mexer em mais nada:
-- O MTCAIXA já sai com **uma linha por carteira + título**, com o valor somado de todos os trades.
-- O **MTCAIXA_ESPECIAIS** usa a mesma função, então muda junto.
-- Os trades de cada linha continuam no CSV do radar, na coluna `operacoes` (ex.: `OP1102:1.200 | OP1145:800`).
+Assim, clicar em **Gerar MTCAIXA** não apaga um aviso de versão nova que ainda está valendo.
 
 ---
 
 ## Teste
 
-1. Coloque nos arquivos de operações uma linha de prêmio com "Tipo Título" = `LF` ou `CDB`.
-2. Gere o MTCAIXA.
-3. No bloco **[1] Leitura** do console, veja o aviso "prêmio de outros tipos ignorado".
-4. Na aba **Títulos do dia**, confira se o título ignorado não aparece e se a coluna **Tipo** mostra CRI, CRA,
-   DEB ou NC.
-5. Abra o `MTCAIXA_LZ.txt`: a coluna 6 deve estar como `PAGAMENTO DE PRÊMIO <tipo> <título>`, sem o código da
-   operação.
+1. Abra a tela **Prêmio** e veja a versão marcada de cada base.
+2. Com a tela aberta, coloque uma versão nova do `operacoes_xz` na pasta CETIP.
+3. Em até 4 segundos aparece `XZ: nova versão às HH:MM, não selecionada.`, e a versão marcada continua a mesma.
+4. Abra a lista do XZ: a versão nova está lá com a marca "mais recente". Escolha qualquer versão e o aviso
+   some.
+5. Renomeie o arquivo marcado do LZ: em até 4 segundos aparece o aviso vermelho, e a lista volta para a 1ª do
+   dia.
+
+Para mudar o intervalo, troque o `INTERVALO_VIGIA_MS` (em milissegundos) do Passo 2.
